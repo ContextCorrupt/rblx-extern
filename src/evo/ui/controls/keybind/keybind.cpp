@@ -6,11 +6,6 @@
 extern const char* stable_keys[ 254 ];
 std::vector<std::string> bind_list = { "Always", "Hold on", "Toggle", "Hold off" };
 
-namespace
-{
-	constexpr float kKeybindModeButtonWidth = 20.0f;
-}
-
 static short int str_idx_bind = -1;
 static bool state_bind = false;
 static int key_bind = -1;
@@ -34,8 +29,8 @@ void evo::keybind_t::paint( ) {
 	auto text_s = _render->text_size( bind_name[ _container->get_id( ) ].c_str( ), evo::fonts_t::_default2 );
 
 	int added_width = text_s.x;
-	int main_width = added_width + static_cast<int>(kKeybindModeButtonWidth) + 14;
-	main_width = std::max(main_width, static_cast<int>(kKeybindModeButtonWidth + 6.0f));
+	int main_width = added_width + 14;
+	main_width = std::max(main_width, 30);
 
 	static int stored_width[ 1000 ]{ main_width };
 	static bool update_bind[ 1000 ]{ false };
@@ -56,15 +51,6 @@ void evo::keybind_t::paint( ) {
 		_container->window_accent, animation.value
 	), 2, 10 );
 	_render->add_rect_filled( this->base_window.x - 2, this->base_window.y, main_width, 17, _container->window_backround, 2 );
-
-	float dropdown_x = this->base_window.x - 2 + main_width - kKeybindModeButtonWidth;
-	_render->add_rect_filled( dropdown_x, this->base_window.y, kKeybindModeButtonWidth, 17, _container->window_backround.darker( -4 ), 2 );
-	_render->add_rect( dropdown_x, this->base_window.y, kKeybindModeButtonWidth, 17, _container->window_outline.modify_alpha( 180 ), 2, 1 );
-	_render->add_text( dropdown_x + ( kKeybindModeButtonWidth / 2.f ) - 3.f,
-		this->base_window.y - 1,
-		_container->window_text,
-		evo::fonts_t::_default2,
-		"v" );
 
 	_render->add_text( this->base_window.x + 5, this->base_window.y - 1, _container->window_text,
 					   evo::fonts_t::_default2, bind_name[ _container->get_id( ) ].c_str( ) );
@@ -109,15 +95,10 @@ void evo::keybind_t::input( ) {
 	auto text_size = _render->text_size( bind_name[ _container->get_id( ) ].c_str( ), evo::fonts_t::_default2 ).x;
 
 	int added_width = text_size;
-	int main_width = added_width + static_cast<int>(kKeybindModeButtonWidth) + 14;
-	main_width = std::max(main_width, static_cast<int>(kKeybindModeButtonWidth + 6.0f));
+	int main_width = added_width + 14;
+	main_width = std::max(main_width, 30);
 
-	/* handling */
-	evo::vec2_t dropdown_pos{ this->base_window.x - 2 + main_width - kKeybindModeButtonWidth, this->base_window.y };
-	evo::vec2_t dropdown_size{ kKeybindModeButtonWidth, 17 };
-	bool hovering_mode = _input->mouse_in_box( dropdown_pos, dropdown_size );
-
-	if ( !hovering_mode && !theme::colorpicker_is_opened && _container->can_interact( ) && GetAsyncKeyState( VK_LBUTTON )
+	if ( !theme::colorpicker_is_opened && _container->can_interact( ) && GetAsyncKeyState( VK_LBUTTON )
 		 && _input->mouse_in_box( { this->base_window.x - 2, this->base_window.y }, 
 								  { (float)main_width, float( 17 ) } ) ) { /* not sure yet */
 		if ( !state_bind )
@@ -172,25 +153,14 @@ void evo::keybind_t::input_list( ) {
 	auto text_size = _render->text_size( bind_name[ _container->get_id( ) ].c_str( ), evo::fonts_t::_default2 ).x;
 
 	int added_width = text_size;
-	int main_width = added_width + static_cast<int>(kKeybindModeButtonWidth) + 14;
-	main_width = std::max(main_width, static_cast<int>(kKeybindModeButtonWidth + 6.0f));
-
-	evo::vec2_t dropdown_pos{ this->base_window.x - 2 + main_width - kKeybindModeButtonWidth, this->base_window.y };
-	evo::vec2_t dropdown_size{ kKeybindModeButtonWidth, 17 };
-	bool dropdown_hovered = _input->mouse_in_box( dropdown_pos, dropdown_size );
+	int main_width = added_width + 14;
+	main_width = std::max(main_width, 30);
 
 	/* handling */
 	if ( state_list && stored_index_list == _container->get_id( ) && _input->key_pressed( VK_LBUTTON )
 		 && !_input->mouse_in_box( { this->base_window.x, this->base_window.y + 15 }, { 80, ( float )( bind_list.size( ) * 23 ) } ) ) {
 		state_list = !state_list;
 		stored_index_list = -1;
-	}
-
-	if ( !_container->base_handler[ 1 ] && !_container->base_handler[ 0 ] &&
-		 !_container->base_handler[ 2 ] && _container->can_interact( ) &&
-		 _input->mouse_in_box( { this->base_window.x - 2, this->base_window.y }, { (float)main_width, 17 } ) && dropdown_hovered && _input->key_pressed( VK_LBUTTON ) ) {
-		state_list = !state_list;
-		stored_index_list = _container->get_id( );
 	}
 
 	/* input */

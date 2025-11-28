@@ -104,7 +104,9 @@ namespace evo {
 
 	public:
 		int pop_id;
-		float track_animation[ 1000 ];
-		int track_size[ 1000 ];
+		float track_animation[ 1000 ] = {};
+		int track_size[ 1000 ] = {};
 	};
+
+	void reset_all_popups();
 }

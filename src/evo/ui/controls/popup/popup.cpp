@@ -1,16 +1,19 @@
 #include "../../../inc.hpp"
-#include <array>
 
-static std::array<bool, 1000> g_popup_state{};
+static int g_active_popup_id = -1;
+static bool g_active_popup_state = false;
 inline static auto str_index_dropdown = -1;
 inline static bool state_dropdown = false;
 inline static int time_dropdown;
+static std::unordered_map<int, int> g_open_dropdown_index;
 
-int elem_height[1000];
+int elem_height[1000]{};
 
 evo::popup_t::popup_t( int pop_id, std::string popup ) { 
 	this->popup = popup;
 	this->pop_id = pop_id;
+	this->focused_element = false;
+	this->hovered = false;
 }
 
 void evo::popup_t::handle_checkbox( ) {
@@ -18,7 +21,10 @@ void evo::popup_t::handle_checkbox( ) {
 		auto animation = animation_controller.get( this->checkbox_elems[ check ].label + "#active" + std::to_string( this->pop_id ) + animation_controller.current_child );
 		animation.adjust( animation.value + 3.f * animation_controller.get_min_deltatime( 0.4f ) * ( *this->checkbox_elems[ check ].value ? 1.f : -1.f ) );
 
-		if ( evo::_input->mouse_in_box( evo::vec2_t( this->base_window.x + 15, this->base_window.y + 35 + elem_height[ this->pop_id ] ),
+		bool allow_interaction = this->focused_element;
+
+		if ( allow_interaction &&
+			evo::_input->mouse_in_box( evo::vec2_t( this->base_window.x + 15, this->base_window.y + 35 + elem_height[ this->pop_id ] ),
 										evo::vec2_t( _container->group_width - 30, 30 ) ) && evo::_input->key_pressed( VK_LBUTTON ) ) {
 			*this->checkbox_elems[ check ].value = !*this->checkbox_elems[ check ].value;
 		}
@@ -70,17 +76,18 @@ void evo::popup_t::handle_slider_int( ) {
 			auto x = _container->group_width - 30;
 			auto delta = slider.max - slider.min;
 			static auto str_index = -1;
+			bool allow_interaction = this->focused_element;
 
 			int text_size = evo::_render->text_size( slider.label.c_str( ), evo::fonts_t::_default2 ).y;
 			//this->hovered = evo::_input->mouse_in_box( vec2_t( this->base_window.x, this->base_window.y + text_size + 4 ), vec2_t( _container->group_width, 7 ) );
 
-			if ( _container->can_interact( ) && !theme::colorpicker_is_opened ) { // + 15 + elem_height
+			if ( allow_interaction && _container->can_interact( ) && !theme::colorpicker_is_opened ) { // + 15 + elem_height
 				if ( _input->key_pressed( VK_LBUTTON ) & 1 && evo::_input->mouse_in_box( vec2_t( this->base_window.x + 15, this->base_window.y + 35 + elem_height[ this->pop_id ] ), vec2_t( _container->group_width - 60, 30 ) ) ) {
 					str_index = _container->get_id( );
 				}
 			}
 
-			if ( GetAsyncKeyState( VK_LBUTTON ) && str_index == _container->get_id( ) ) {
+			if ( allow_interaction && GetAsyncKeyState( VK_LBUTTON ) && str_index == _container->get_id( ) ) {
 				//t//his->in_use = true;
 
 				float normalized_pos = ( _input->get_mouse_position( ).x - this->base_window.x ) / ( _container->group_width - 30 );
@@ -99,7 +106,7 @@ void evo::popup_t::handle_slider_int( ) {
 			}
 
 			/* update index */
-			if ( !GetAsyncKeyState( VK_LBUTTON ) ) {
+			if ( !allow_interaction || !GetAsyncKeyState( VK_LBUTTON ) ) {
 				//this->in_use = false;
 				str_index = -1;
 			}
@@ -144,17 +151,18 @@ void evo::popup_t::handle_slider_float( ) {
 			auto x = _container->group_width - 30;
 			auto delta = slider.max - slider.min;
 			static auto str_index = -1;
+			bool allow_interaction = this->focused_element;
 
 			int text_size = evo::_render->text_size( slider.label.c_str( ), evo::fonts_t::_default2 ).y;
 			//this->hovered = evo::_input->mouse_in_box( vec2_t( this->base_window.x, this->base_window.y + text_size + 4 ), vec2_t( _container->group_width, 7 ) );
 
-			if ( _container->can_interact( ) && !theme::colorpicker_is_opened ) { // + 15 + elem_height
+			if ( allow_interaction && _container->can_interact( ) && !theme::colorpicker_is_opened ) { // + 15 + elem_height
 				if ( _input->key_pressed( VK_LBUTTON ) & 1 && evo::_input->mouse_in_box( vec2_t( this->base_window.x + 15, this->base_window.y + 35 + elem_height[ this->pop_id ] ), vec2_t( _container->group_width - 60, 30 ) ) ) {
 					str_index = _container->get_id( );
 				}
 			}
 
-			if ( GetAsyncKeyState( VK_LBUTTON ) && str_index == _container->get_id( ) ) {
+			if ( allow_interaction && GetAsyncKeyState( VK_LBUTTON ) && str_index == _container->get_id( ) ) {
 				//t//his->in_use = true;
 
 				float normalized_pos = ( _input->get_mouse_position( ).x - this->base_window.x ) / ( _container->group_width - 30 );
@@ -173,7 +181,7 @@ void evo::popup_t::handle_slider_float( ) {
 			}
 
 			/* update index */
-			if ( !GetAsyncKeyState( VK_LBUTTON ) ) {
+			if ( !allow_interaction || !GetAsyncKeyState( VK_LBUTTON ) ) {
 				//this->in_use = false;
 				str_index = -1;
 			}
@@ -202,7 +210,85 @@ void evo::popup_t::handle_text( ) {
 	}
 }
 
-void evo::popup_t::handle_dropdown( ) { }
+void evo::popup_t::handle_dropdown( ) {
+	int open_dropdown_index = -1;
+	if ( auto it = g_open_dropdown_index.find( this->pop_id ); it != g_open_dropdown_index.end( ) )
+		open_dropdown_index = it->second;
+	if ( !this->focused_element )
+		open_dropdown_index = -1;
+
+	for ( std::size_t dropdown_idx = 0; dropdown_idx < this->elem_drop.size( ); ++dropdown_idx ) {
+		auto& dropdown = this->elem_drop[ dropdown_idx ];
+		dropdown.focused = this->focused_element && ( open_dropdown_index == static_cast< int >( dropdown_idx ) );
+
+		const float ctrl_width = _container->group_width - 30;
+		const float ctrl_height = 30.f;
+		const float base_x = this->base_window.x + 15;
+		const float base_y = this->base_window.y + 35 + elem_height[ this->pop_id ];
+		const float text_y = this->base_window.y + 41 + elem_height[ this->pop_id ];
+		const float items_height = dropdown.focused ? static_cast<float>( dropdown.items.size( ) * 25 ) : 0.f;
+		bool allow_interaction = this->focused_element;
+
+		int current_value = dropdown.items.empty( ) ? 0 : std::clamp( *dropdown.value, 0, static_cast< int >( dropdown.items.size( ) ) - 1 );
+		if ( !dropdown.items.empty( ) && current_value != *dropdown.value )
+			*dropdown.value = current_value;
+
+		bool header_hovered = evo::_input->mouse_in_box( { base_x, base_y }, { ctrl_width, ctrl_height } );
+		bool list_hovered = false;
+		if ( dropdown.focused && items_height > 0.f )
+			list_hovered = evo::_input->mouse_in_box( { base_x, base_y + ctrl_height + 5.f }, { ctrl_width, items_height } );
+
+		_ext->make_rect( base_x, base_y, ctrl_width, ctrl_height, _container->window_outline.modify_alpha( 80 * this->track_animation[ this->pop_id ] ), 2, 1 );
+		_ext->make_text( base_x + 10, text_y, _container->window_text.modify_alpha( 155 * this->track_animation[ this->pop_id ] ), evo::fonts_t::_default2, dropdown.label.c_str( ) );
+
+		std::string current_label = dropdown.items.empty( ) ? "none" : dropdown.items[ current_value ];
+		auto text_size = _render->text_size( current_label.c_str( ), evo::fonts_t::_default2 );
+		_ext->make_text( base_x + ctrl_width - 10 - text_size.x, text_y, _container->window_text.modify_alpha( 155 * this->track_animation[ this->pop_id ] ), evo::fonts_t::_default2, current_label.c_str( ) );
+		_ext->make_text( base_x + ctrl_width - 20, text_y - 1, _container->window_text.modify_alpha( 155 * this->track_animation[ this->pop_id ] ), evo::fonts_t::_arrows, dropdown.focused ? "a" : "d" );
+
+		if ( allow_interaction && _container->can_interact( ) && header_hovered && _input->key_pressed( VK_LBUTTON ) ) {
+			dropdown.focused = !dropdown.focused;
+			open_dropdown_index = dropdown.focused ? static_cast< int >( dropdown_idx ) : -1;
+		}
+
+		if ( dropdown.focused && allow_interaction && !header_hovered && !list_hovered && _input->key_pressed( VK_LBUTTON ) ) {
+			dropdown.focused = false;
+			if ( open_dropdown_index == static_cast< int >( dropdown_idx ) )
+				open_dropdown_index = -1;
+		}
+
+		if ( dropdown.focused && !dropdown.items.empty( ) ) {
+			float list_y = base_y + ctrl_height + 5.f;
+			_ext->make_rect_filled( base_x, list_y, ctrl_width, items_height, _container->window_backround.modify_alpha( 255 * this->track_animation[ this->pop_id ] ), 2 );
+			_ext->make_rect( base_x, list_y, ctrl_width, items_height, _container->window_outline.modify_alpha( 80 * this->track_animation[ this->pop_id ] ), 2, 1 );
+
+			for ( std::size_t idx = 0; idx < dropdown.items.size( ); ++idx ) {
+				float item_y = list_y + static_cast< float >( idx ) * 25.f;
+				bool item_hovered = evo::_input->mouse_in_box( { base_x, item_y }, { ctrl_width, 25.f } );
+				auto item_color = item_hovered ? _container->window_backround.darker( -5 ) : _container->window_backround;
+				item_color = item_color.modify_alpha( 255 * this->track_animation[ this->pop_id ] );
+				_ext->make_rect_filled( base_x, item_y, ctrl_width, 25.f, item_color, 0 );
+				_ext->make_text( base_x + 10, item_y + 5, _container->window_text.modify_alpha( 200 * this->track_animation[ this->pop_id ] ), evo::fonts_t::_default2, dropdown.items[ idx ].c_str( ) );
+
+				if ( allow_interaction && item_hovered && _input->key_pressed( VK_LBUTTON ) ) {
+					*dropdown.value = static_cast< int >( idx );
+					dropdown.focused = false;
+					open_dropdown_index = -1;
+					break;
+				}
+			}
+		}
+
+		int extra_height = dropdown.focused ? static_cast< int >( items_height ) + 5 : 0;
+		elem_height[ this->pop_id ] += 35 + extra_height;
+		_container->set_id( _container->get_id( ) + 1 );
+	}
+
+	if ( open_dropdown_index >= 0 )
+		g_open_dropdown_index[ this->pop_id ] = open_dropdown_index;
+	else
+		g_open_dropdown_index.erase( this->pop_id );
+}
 
 void evo::popup_t::paint( ) { 
 	elem_height[ this->pop_id ] = 0;
@@ -221,6 +307,7 @@ void evo::popup_t::paint( ) {
 	this->handle_checkbox( );
 	this->handle_slider_int( );
 	this->handle_slider_float( );
+	this->handle_dropdown( );
 	this->handle_text( );
 	
 	// store.
@@ -248,28 +335,33 @@ void evo::popup_t::paint( ) {
 
 void evo::popup_t::input( ) { 
 	bool header_hovered = _input->mouse_in_box( { this->base_window.x, this->base_window.y }, { ( float )_container->group_width, 30 } );
+	bool body_hovered = _input->mouse_in_box( { this->base_window.x, this->base_window.y }, { ( float )_container->group_width, 30 + ( float )elem_height[ this->pop_id ] } );
+
 	if ( _container->can_interact( ) && header_hovered && _input->key_pressed( VK_LBUTTON ) && !_container->base_handler[ 3 ] ) {
-		g_popup_state[ this->pop_id ] = !g_popup_state[ this->pop_id ];
-	}
-
-	bool full_bounds_hovered = _input->mouse_in_box( { this->base_window.x, this->base_window.y }, { ( float )_container->group_width, 30 + ( float )elem_height[ this->pop_id ] } );
-	if ( g_popup_state[ this->pop_id ] && !full_bounds_hovered && _input->key_pressed( VK_LBUTTON ) ) {
-		g_popup_state[ this->pop_id ] = false;
-	}
-
-	this->focused_element = g_popup_state[ this->pop_id ];
-
-	bool any_open = false;
-	for ( bool state : g_popup_state ) {
-		if ( state ) {
-			any_open = true;
-			break;
+		if ( g_active_popup_id == _container->get_id( ) ) {
+			g_active_popup_state = !g_active_popup_state;
+			if ( !g_active_popup_state )
+				g_active_popup_id = -1;
+		} else {
+			g_active_popup_id = _container->get_id( );
+			g_active_popup_state = true;
 		}
 	}
 
-	_container->base_handler[ 0 ] = any_open;
+	if ( g_active_popup_id == _container->get_id( ) )
+		this->focused_element = g_active_popup_state;
+	else
+		this->focused_element = false;
+
+	if ( g_active_popup_id == _container->get_id( ) && !body_hovered && _input->key_pressed( VK_LBUTTON ) ) {
+		g_active_popup_state = false;
+		g_active_popup_id = -1;
+		this->focused_element = false;
+	}
+
+	_container->base_handler[ 0 ] = g_active_popup_state;
 	_container->base_opened_state[ _container->base_handler_t::colorpicker ][ _container->get_id( ) ] = this->focused_element;
-	this->hovered = full_bounds_hovered;
+	this->hovered = body_hovered;
 }
 
 void evo::popup_t::bind_checkbox( std::string label, bool* value ) {
@@ -290,4 +382,13 @@ void evo::popup_t::bind_text( std::string label ) {
 
 void evo::popup_t::bind_dropdown( std::string label, int* value, std::vector<std::string> items ) { 
 	this->elem_drop.push_back( elem_dropdown( label, value, items ) );
+}
+
+void evo::reset_all_popups()
+{
+	g_active_popup_state = false;
+	g_active_popup_id = -1;
+	g_open_dropdown_index.clear();
+	for (auto &height : elem_height)
+		height = 0;
 }

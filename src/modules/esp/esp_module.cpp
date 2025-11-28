@@ -376,6 +376,68 @@ namespace
         push_sample(left_foot_geom, vector3(0.0f, -1.0f, 0.0f));
         push_sample(right_foot_geom, vector3(0.0f, -1.0f, 0.0f));
 
+        if (cached.hrp_bounds_valid)
+        {
+            matrix3 inv_rot = cached.hrp_rotation.transpose();
+            vector3 min_local(-cached.hrp_half.X, -cached.hrp_half.Y, -cached.hrp_half.Z);
+            vector3 max_local(cached.hrp_half.X, cached.hrp_half.Y, cached.hrp_half.Z);
+
+            auto include_point = [&](const vector3 &pt) {
+                if (!std::isfinite(pt.X) || !std::isfinite(pt.Y) || !std::isfinite(pt.Z))
+                    return;
+                vector3 local = inv_rot.multiply(pt - cached.hrp_center);
+                min_local.X = std::min(min_local.X, local.X);
+                min_local.Y = std::min(min_local.Y, local.Y);
+                min_local.Z = std::min(min_local.Z, local.Z);
+                max_local.X = std::max(max_local.X, local.X);
+                max_local.Y = std::max(max_local.Y, local.Y);
+                max_local.Z = std::max(max_local.Z, local.Z);
+            };
+
+            for (std::size_t i = 0; i < cached.point_count; ++i)
+                include_point(cached.points[i]);
+
+            auto include_geometry_extremes = [&](const PartGeometry &geom) {
+                if (!geom.valid)
+                    return;
+                static const vector3 kOffsets[] = {
+                    {0.0f, 1.0f, 0.0f},
+                    {0.0f, -1.0f, 0.0f},
+                    {1.0f, 0.0f, 0.0f},
+                    {-1.0f, 0.0f, 0.0f},
+                    {0.0f, 0.0f, 1.0f},
+                    {0.0f, 0.0f, -1.0f}
+                };
+                for (const auto &offset : kOffsets)
+                {
+                    vector3 extreme;
+                    if (sample_from_geometry(geom, offset, extreme))
+                        include_point(extreme);
+                }
+            };
+
+            include_geometry_extremes(head_geom);
+            include_geometry_extremes(chest_geom);
+            include_geometry_extremes(pelvis_geom);
+            include_geometry_extremes(left_hand_geom);
+            include_geometry_extremes(right_hand_geom);
+            include_geometry_extremes(left_foot_geom);
+            include_geometry_extremes(right_foot_geom);
+
+            vector3 new_center_local(
+                (min_local.X + max_local.X) * 0.5f,
+                (min_local.Y + max_local.Y) * 0.5f,
+                (min_local.Z + max_local.Z) * 0.5f);
+
+            vector3 new_half(
+                std::max(0.1f, (max_local.X - min_local.X) * 0.5f),
+                std::max(0.1f, (max_local.Y - min_local.Y) * 0.5f),
+                std::max(0.1f, (max_local.Z - min_local.Z) * 0.5f));
+
+            cached.hrp_center = cached.hrp_center + cached.hrp_rotation.multiply(new_center_local);
+            cached.hrp_half = new_half;
+        }
+
         if (cached.point_count < 3)
         {
             push_point(hrp_pos + vector3(0.0f, 2.0f, 0.0f));
@@ -695,8 +757,8 @@ namespace
 ESPModule::ESPModule()
     : Module("esp", "render player overlays")
 {
-    settings.push_back(Setting("boxes", true));
-    settings.push_back(Setting("3d boxes", false));
+    settings.push_back(Setting("enable esp", true));
+    settings.push_back(Setting("esp box mode", 0, 0, 1));
     settings.push_back(Setting("names", true));
     settings.push_back(Setting("distance", true));
     settings.push_back(Setting("health bar", true));
@@ -723,8 +785,8 @@ void ESPModule::on_render()
 {
     auto now = std::chrono::steady_clock::now();
 
-    auto box_setting = get_setting("boxes");
-    auto box3d_setting = get_setting("3d boxes");
+    auto enable_setting = get_setting("enable esp");
+    auto box_mode_setting = get_setting("esp box mode");
     auto name_setting = get_setting("names");
     auto distance_setting = get_setting("distance");
     auto health_bar_setting = get_setting("health bar");
@@ -796,8 +858,22 @@ void ESPModule::on_render()
 
     FrameProfiler frame_profiler;
 
-    const bool draw_box = box_setting && box_setting->value.bool_val;
-    const bool draw_box3d = box3d_setting && box3d_setting->value.bool_val;
+    bool esp_enabled = !enable_setting || enable_setting->value.bool_val;
+    if (!esp_enabled)
+        return;
+
+    int box_mode = 0;
+    if (box_mode_setting && box_mode_setting->type == cradle::modules::SettingType::INT)
+    {
+        int min_val = box_mode_setting->range.int_range.min;
+        int max_val = box_mode_setting->range.int_range.max;
+        box_mode = std::clamp(box_mode_setting->value.int_val, min_val, max_val);
+        if (box_mode_setting->value.int_val != box_mode)
+            box_mode_setting->value.int_val = box_mode;
+    }
+
+    const bool draw_box = box_mode == 0;
+    const bool draw_box3d = box_mode == 1;
     const bool draw_name = name_setting && name_setting->value.bool_val;
     const bool draw_distance = distance_setting && distance_setting->value.bool_val;
     const bool draw_health = health_bar_setting && health_bar_setting->value.bool_val;

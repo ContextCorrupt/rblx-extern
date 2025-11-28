@@ -357,12 +357,16 @@ namespace cradle
 
                                     g_active_tab = std::clamp(g_active_tab, 0, static_cast<int>(kTabs.size() - 1));
                                     evo::theme::selected_tab = g_active_tab;
+                                    int previous_tab = g_active_tab;
 
                                     auto window = new evo::window_t("mossad.is", &evo::theme::menu_spawn, evo::theme::menu_size, tab_icons, &g_active_tab);
                                     {
                                         RenderTabContents(window, static_cast<EvoTab>(g_active_tab));
                                     }
                                     delete window;
+
+                                    if (g_active_tab != previous_tab)
+                                        evo::reset_all_popups();
 
                                     evo::externals::_ext_b->begin();
                                     evo::externals::_ext_b_p->begin_popup();
@@ -744,8 +748,24 @@ namespace cradle
                                         });
                                     };
 
-                                    bind_checkbox("boxes", general_bindings);
-                                    bind_checkbox("3d boxes", general_bindings);
+                                    auto bind_dropdown = [&](const char *setting_name, const std::vector<std::string> &choices, std::vector<std::function<void(evo::popup_t *)>> &bucket) {
+                                        auto *setting = module->get_setting(setting_name);
+                                        if (!setting || setting->type != cradle::modules::SettingType::INT)
+                                            return;
+                                        int before = setting->value.int_val;
+                                        std::vector<std::string> labels = choices;
+                                        bucket.emplace_back([setting, labels](evo::popup_t *popup) {
+                                            popup->bind_dropdown(setting->name, &setting->value.int_val, labels);
+                                        });
+                                        dirty_checks.emplace_back([before, setting]() {
+                                            if (before != setting->value.int_val)
+                                                cradle::config::ConfigManager::mark_dirty();
+                                        });
+                                    };
+
+                                    bind_checkbox("enable esp", general_bindings);
+                                    static const std::vector<std::string> kBoxModes = {"2d box", "3d box"};
+                                    bind_dropdown("esp box mode", kBoxModes, general_bindings);
                                     bind_checkbox("names", general_bindings);
                                     bind_checkbox("distance", general_bindings);
                                     bind_checkbox("health bar", general_bindings);
@@ -1375,6 +1395,8 @@ namespace cradle
                                     menu_visible = !menu_visible;
                                     showMenu = menu_visible;
                                     evo::theme::menu_open = menu_visible;
+                                    if (!menu_visible)
+                                        evo::reset_all_popups();
                                     updateInputPassthrough();
                                 }
                                 insert_prev_down = insert_down;
@@ -1383,6 +1405,8 @@ namespace cradle
                                 {
                                     menu_visible = evo::theme::menu_open;
                                     showMenu = menu_visible;
+                                    if (!menu_visible)
+                                        evo::reset_all_popups();
                                     updateInputPassthrough();
                                 }
 
