@@ -1,0 +1,6 @@
+# Remote whitelist source:
+# https://raw.githubusercontent.com/07zj/pciehwid/refs/heads/main/list
+# Those entries are fetched automatically. Add local overrides below (one per line).
+# Example entry:
+# PCI\VEN_1002&DEV_164E&SUBSYS_88771043&REV_CB\4&1EBE6A9C&0&0041
+

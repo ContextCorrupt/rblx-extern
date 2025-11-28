@@ -32,6 +32,7 @@ extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd, UINT msg
 #include <dwmapi.h>
 #include <limits>
 #include <mutex>
+#include <atomic>
 #include "../util/engine/visualengine/visualengine.hpp"
 #include "../util/engine/datamodel/datamodel.hpp"
 #include "../util/engine/instance/instance.hpp"
@@ -1088,6 +1089,8 @@ namespace cradle
 
                                 static constexpr int kLoadingStageCount = 4;
                                 static constexpr std::size_t kLoaderLogCapacity = 64;
+                                static constexpr std::array<double, kLoadingStageCount> kStageProgressDurations = {0.0, 6.0, 3.5, 1.0};
+                                static std::atomic<double> g_loader_stage_change_time{0.0};
 
                                 static std::mutex g_loader_log_mutex;
                                 static std::deque<std::string> g_loader_log_lines;
@@ -1130,6 +1133,57 @@ namespace cradle
                                     }
                                 }
 
+                                static double GetNowSeconds()
+                                {
+                                    using clock = std::chrono::steady_clock;
+                                    return std::chrono::duration<double>(clock::now().time_since_epoch()).count();
+                                }
+
+                                static float CalculateLoaderProgress(Overlay::LoadingStage stage)
+                                {
+                                    static float s_displayed_progress = 0.0f;
+                                    static double s_last_update_time = 0.0;
+
+                                    if constexpr (kLoadingStageCount <= 1)
+                                        return 1.0f;
+
+                                    const double now = GetNowSeconds();
+                                    const int stage_index = LoadingStageToIndex(stage);
+                                    double base = static_cast<double>(stage_index);
+                                    if (stage != Overlay::LoadingStage::WaitingForRoblox &&
+                                        stage_index >= 0 &&
+                                        stage_index < (kLoadingStageCount - 1))
+                                    {
+                                        const double stage_start = g_loader_stage_change_time.load(std::memory_order_relaxed);
+                                        const double elapsed = std::max(0.0, now - stage_start);
+                                        const std::size_t duration_index = static_cast<std::size_t>(
+                                            std::min(stage_index, static_cast<int>(kStageProgressDurations.size() - 1)));
+                                        double duration = kStageProgressDurations[duration_index];
+                                        if (duration <= 0.0)
+                                            duration = 1.0;
+                                        const double stage_fraction = std::min(elapsed / duration, 0.95);
+                                        base += stage_fraction;
+                                    }
+
+                                    double normalized = base / static_cast<double>(kLoadingStageCount - 1);
+                                    float target = static_cast<float>(std::clamp(normalized, 0.0, 1.0));
+
+                                    const double delta_seconds = std::max(0.0, now - s_last_update_time);
+                                    float max_step = static_cast<float>(delta_seconds * 1.25);
+                                    if (max_step < 0.02f)
+                                        max_step = 0.02f;
+
+                                    const float delta = target - s_displayed_progress;
+                                    if (std::fabs(delta) <= max_step)
+                                        s_displayed_progress = target;
+                                    else
+                                        s_displayed_progress += (delta > 0.0f ? max_step : -max_step);
+
+                                    s_displayed_progress = std::clamp(s_displayed_progress, 0.0f, 1.0f);
+                                    s_last_update_time = now;
+                                    return s_displayed_progress;
+                                }
+
                                 static void AppendLoaderLogLine(const std::string &line)
                                 {
                                     std::lock_guard<std::mutex> lock(g_loader_log_mutex);
@@ -1166,20 +1220,20 @@ namespace cradle
                                     installed = true;
                                 }
 
-                                static std::vector<std::string> GetLoaderLogSnapshot()
+                                [[maybe_unused]] static std::vector<std::string> GetLoaderLogSnapshot()
                                 {
                                     std::lock_guard<std::mutex> lock(g_loader_log_mutex);
                                     return std::vector<std::string>(g_loader_log_lines.begin(), g_loader_log_lines.end());
                                 }
 
-                                static std::filesystem::path GetLoaderLogFilePath()
+                                [[maybe_unused]] static std::filesystem::path GetLoaderLogFilePath()
                                 {
                                     std::filesystem::path base = std::filesystem::current_path();
                                     base /= "logs";
                                     return base / "bootstrap_console.txt";
                                 }
 
-                                static bool ExportLoaderLogs()
+                                [[maybe_unused]] static bool ExportLoaderLogs()
                                 {
                                     auto lines = GetLoaderLogSnapshot();
                                     auto path = GetLoaderLogFilePath();
@@ -1252,7 +1306,7 @@ namespace cradle
                                     return result;
                                 }
 
-                                static std::vector<std::string> WrapText(const std::string &text, std::size_t max_chars)
+                                [[maybe_unused]] static std::vector<std::string> WrapText(const std::string &text, std::size_t max_chars)
                                 {
                                     std::vector<std::string> lines;
                                     if (text.empty())
@@ -1293,68 +1347,31 @@ namespace cradle
                                     return lines;
                                 }
 
-                                static std::string BuildConsoleTextboxContent(const std::vector<std::string> &log_lines,
-                                                                                const std::string &status_line,
-                                                                                const char *stage_text,
-                                                                                const char *progress_label,
-                                                                                const char *hint,
-                                                                                bool failed,
-                                                                                bool ready)
+                                static std::string BuildStatusAndProgressText(const std::string &status_line,
+                                                             const char *stage_text,
+                                                             const char *progress_label)
                                 {
                                     std::string text;
-                                    text.reserve(1024);
+                                    text.reserve(256);
 
-                                    text += "bootstrap console\n";
-                                    text += std::string("stage · ") + stage_text + "\n";
-                                    text += std::string("progress · ") + progress_label + "\n";
-                                    text += std::string("status · ") + CollapseWhitespace(status_line) + "\n\n";
-
-                                    if (log_lines.empty())
+                                    text += "status · ";
+                                    text += stage_text;
+                                    std::string collapsed = CollapseWhitespace(status_line);
+                                    if (!collapsed.empty())
                                     {
-                                        text += "• awaiting loader events...\n\n";
+                                        text += " — ";
+                                        text += collapsed;
                                     }
-                                    else
-                                    {
-                                        for (const auto &line : log_lines)
-                                        {
-                                            auto wrapped = WrapText(line, 64);
-                                            if (wrapped.empty())
-                                                continue;
-
-                                            bool is_entry_head = true;
-                                            for (const auto &piece : wrapped)
-                                            {
-                                                text += is_entry_head ? "• " : "  ";
-                                                text += piece;
-                                                text += '\n';
-                                                is_entry_head = false;
-                                            }
-                                            text += '\n';
-                                        }
-                                    }
-
-                                    text += std::string("hint · ") + CollapseWhitespace(hint) + '\n';
-                                    if (failed)
-                                        text += "action · restart Roblox and relaunch the loader\n";
-                                    else if (ready)
-                                        text += "action · press Delete to open the menu\n";
-                                    else
-                                        text += "action · no input required\n";
-                                    text += "controls · Delete opens the menu once in-game";
-
+                                    text += "\nprogress · ";
+                                    text += progress_label;
                                     return text;
                                 }
 
                                 static void RenderLoadingWindowContent(evo::window_t *window,
-                                                                        Overlay::LoadingStage stage,
-                                                                        const std::string &raw_message)
+                                                                     Overlay::LoadingStage stage,
+                                                                     const std::string &raw_message)
                                 {
                                     constexpr int kLoaderTabIndex = 0;
-
-                                    const bool failed = stage == Overlay::LoadingStage::Failed;
-                                    const bool ready = stage == Overlay::LoadingStage::Ready;
-                                    int stage_index = LoadingStageToIndex(stage);
-                                    int visual_stage_index = std::clamp(stage_index, 0, kLoadingStageCount - 1);
 
                                     const char *stage_text = "loading";
                                     switch (stage)
@@ -1380,13 +1397,7 @@ namespace cradle
                                     if (collapsed_message.empty())
                                         collapsed_message = "Preparing environment...";
 
-                                    const char *hint = failed ? "Something interrupted the attachment sequence. Restart Roblox and relaunch the loader."
-                                                              : "Overlay enables itself automatically once the runtime is ready.";
-
-                                    float progress_fraction = 0.0f;
-                                    if constexpr (kLoadingStageCount > 1)
-                                        progress_fraction = static_cast<float>(visual_stage_index) / static_cast<float>(kLoadingStageCount - 1);
-                                    progress_fraction = std::clamp(progress_fraction, 0.0f, 1.0f);
+                                    float progress_fraction = CalculateLoaderProgress(stage);
                                     int progress_pct = static_cast<int>(std::round(progress_fraction * 100.0f));
                                     progress_pct = std::clamp(progress_pct, 0, 100);
                                     char progress_label[32];
@@ -1396,14 +1407,8 @@ namespace cradle
                                     console_child->full_child();
                                     {
                                         window->make_child(console_child);
-                                        auto log_lines = GetLoaderLogSnapshot();
-                                        std::string console_block = BuildConsoleTextboxContent(log_lines, collapsed_message, stage_text, progress_label, hint, failed, ready);
-                                        float available_height = std::max(0.0f, console_child->get_content_height() - 55.0f);
-                                        console_child->make_text(console_block, available_height);
-                                        console_child->make_button("export console log", []() {
-                                            ExportLoaderLogs();
-                                        });
-                                        console_child->enable_scrolling();
+                                        std::string console_block = BuildStatusAndProgressText(collapsed_message, stage_text, progress_label);
+                                        console_child->make_text(console_block, console_child->get_content_height());
                                     }
                                     delete console_child;
                                 }
@@ -1869,7 +1874,9 @@ namespace cradle
 
                             void Overlay::set_loading_stage(LoadingStage stage, const std::string &message)
                             {
-                                loading_stage.store(stage, std::memory_order_relaxed);
+                                LoadingStage previous_stage = loading_stage.exchange(stage, std::memory_order_relaxed);
+                                if (previous_stage != stage || g_loader_stage_change_time.load(std::memory_order_relaxed) == 0.0)
+                                    g_loader_stage_change_time.store(GetNowSeconds(), std::memory_order_relaxed);
                                 {
                                     std::lock_guard<std::mutex> lock(loading_message_mutex);
                                     loading_message = message;
@@ -1913,6 +1920,7 @@ namespace cradle
                                 instance = this;
                                 InstallBootstrapConsoleSink();
                                 EnsureConsoleHidden();
+                                g_loader_stage_change_time.store(GetNowSeconds(), std::memory_order_relaxed);
                                 createWindow();
                                 if (!overlayWindow)
                                 {

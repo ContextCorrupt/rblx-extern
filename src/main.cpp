@@ -2,6 +2,7 @@
 #include <chrono>
 #include <thread>
 #include <atomic>
+#include <windows.h>
 #include "overlay/overlay.hpp"
 #include "util/memory/memory.hpp"
 #include "util/engine/offsets.hpp"
@@ -17,6 +18,7 @@
 #include "modules/friends/friends_module.hpp"
 #include "modules/profiling/profiling_module.hpp"
 #include "config/config_manager.hpp"
+#include "util/security/hwid.hpp"
 
 namespace
 {
@@ -90,10 +92,40 @@ namespace
 
         spdlog::warn("Humanoid WalkspeedCheck value unavailable (local humanoid not ready)");
     }
+
+    bool EnforceHardwareAuthorization()
+    {
+        auto whitelist = cradle::security::LoadGpuWhitelist();
+        auto validation = cradle::security::ValidateGpuWhitelist(whitelist);
+        if (validation.authorized)
+        {
+            spdlog::info("Authorized GPU HWID detected: {}", validation.detected_id);
+            return true;
+        }
+
+        std::string message = validation.message.empty() ? "GPU HWID authorization failed" : validation.message;
+        if (!validation.detected_id.empty())
+        {
+            message += "\nDetected GPU: ";
+            message += validation.detected_id;
+        }
+
+        auto whitelist_path = cradle::security::GetWhitelistFilePath();
+        message += "\nWhitelist file: ";
+        message += whitelist_path.u8string();
+        message += "\nAdd the GPU's PNPDeviceID to authorize this system.";
+
+        spdlog::error("HWID check failed: {}", message);
+        MessageBoxA(nullptr, message.c_str(), "Cradle loader", MB_OK | MB_ICONERROR);
+        return false;
+    }
 }
 
 int main()
 {
+    if (!EnforceHardwareAuthorization())
+        return 1;
+
     cradle::overlay::Overlay overlay;
     if (!overlay.initialize())
     {

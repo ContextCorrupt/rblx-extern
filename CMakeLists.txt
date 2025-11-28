@@ -21,6 +21,7 @@ file(GLOB_RECURSE SOURCES
     ${PROJECT_SOURCE_DIR}/src/util/engine/input/*.cpp
     ${PROJECT_SOURCE_DIR}/src/util/engine/visualengine/*.cpp
     ${PROJECT_SOURCE_DIR}/src/util/engine/wallcheck/*.cpp
+    ${PROJECT_SOURCE_DIR}/src/util/security/*.cpp
     ${PROJECT_SOURCE_DIR}/src/util/profiling/*.cpp
     ${PROJECT_SOURCE_DIR}/src/cache/*.cpp
     ${PROJECT_SOURCE_DIR}/src/imgui_impl_dx11.cpp
@@ -47,6 +48,8 @@ target_link_libraries(${PROJECT_NAME} PRIVATE
     dxgi
     d3dcompiler
     dwmapi
+    wbemuuid
+    winhttp
 )
 
 if(MSVC)
