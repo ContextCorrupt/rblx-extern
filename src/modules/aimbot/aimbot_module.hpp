@@ -11,5 +11,6 @@ namespace cradle::modules
         AimbotModule();
         void on_update() override;
         void on_render() override;
+        bool allow_render_when_disabled() override;
     };
 }

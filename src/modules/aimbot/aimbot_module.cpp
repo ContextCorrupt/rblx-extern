@@ -21,6 +21,7 @@ namespace cradle::modules
 
         settings.push_back(Setting("fov size", 100.0f, 10.0f, 500.0f));
         settings.push_back(Setting("fov circle", true));
+        settings.push_back(Setting("fov always visible", false));
         settings.push_back(Setting("wall check", true));
         settings.push_back(Setting("team check", true));
         settings.push_back(Setting("smoothness", 0.0f, 0.0f, 0.95f));
@@ -314,7 +315,12 @@ namespace cradle::modules
     void AimbotModule::on_render()
     {
         auto show_fov_setting = get_setting("fov circle");
+        auto fov_always_setting = get_setting("fov always visible");
         if (!show_fov_setting || !show_fov_setting->value.bool_val)
+            return;
+
+        bool always_visible = fov_always_setting && fov_always_setting->value.bool_val;
+        if (!is_enabled() && !always_visible)
             return;
 
         auto fov_size_setting = get_setting("fov size");
@@ -361,5 +367,14 @@ namespace cradle::modules
         {
             draw_list->AddCircle(fov_center, fov_size, fov_color, 64, 2.0f);
         }
+    }
+
+    bool AimbotModule::allow_render_when_disabled()
+    {
+        auto show_fov_setting = get_setting("fov circle");
+        auto fov_always_setting = get_setting("fov always visible");
+        if (!show_fov_setting || !show_fov_setting->value.bool_val)
+            return false;
+        return fov_always_setting && fov_always_setting->value.bool_val;
     }
 }

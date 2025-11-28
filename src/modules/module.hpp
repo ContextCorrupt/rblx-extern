@@ -62,6 +62,7 @@ namespace cradle::modules
         virtual void on_disable() {}
         virtual void on_update() {}
         virtual void on_render() {}
+    virtual bool allow_render_when_disabled() { return false; }
 
         void toggle() {
             enabled = !enabled;

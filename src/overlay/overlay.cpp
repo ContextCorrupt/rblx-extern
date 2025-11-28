@@ -16,6 +16,7 @@ extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd, UINT msg
 #include <chrono>
 #include <cmath>
 #include <cctype>
+#include <functional>
 #include <tlhelp32.h>
 #include <string>
 #include <vector>
@@ -89,6 +90,19 @@ namespace cradle
             int g_active_tab = 0;
             cradle::modules::Module *g_selected_module = nullptr;
             bool g_memory_view_active = false;
+
+            struct CheatIndicatorEntry
+            {
+                const char *label;
+                const char *module_name;
+            };
+
+            constexpr size_t kCheatIndicatorCount = 4;
+            constexpr std::array<CheatIndicatorEntry, kCheatIndicatorCount> kCheatIndicatorEntries = {
+                CheatIndicatorEntry{"aimbot", "aimbot"},
+                CheatIndicatorEntry{"triggerbot", "triggerbot"},
+                CheatIndicatorEntry{"silent aim", "silent aim"},
+                CheatIndicatorEntry{"anti aim", "anti aim"}};
 
             struct MovementOverrideState
             {
@@ -326,11 +340,13 @@ namespace cradle
                                 }
 
                                 void RenderModulePanel(evo::child_t *child, cradle::modules::Module *module);
+                                void RenderEspSettings(evo::child_t *child, cradle::modules::Module *module);
                                 void RenderMemoryPanel(evo::child_t *child);
                                 void RenderVisualColorPanel(evo::child_t *child);
                                 void RenderProfilingPanel(evo::child_t *child, cradle::modules::Module *module);
                                 void RenderConfigTab(evo::window_t *window);
                                 void RenderTabContents(evo::window_t *window, EvoTab tab);
+                                void RenderCheatIndicator();
 
                                 void RenderEvoMenuWindow(Overlay &overlay)
                                 {
@@ -598,6 +614,12 @@ namespace cradle
                                         return;
                                     }
 
+                                    if (is_esp)
+                                    {
+                                        RenderEspSettings(child, module);
+                                        return;
+                                    }
+
                                     for (auto &setting : module->get_settings())
                                     {
                                         if (is_esp)
@@ -654,7 +676,7 @@ namespace cradle
                                         }
                                         case cradle::modules::SettingType::COLOR:
                                         {
-                                            if (is_esp)
+                                            if (is_esp || is_aimbot)
                                                 break;
                                             RenderColorSettingControl(child, setting);
                                             break;
@@ -663,29 +685,211 @@ namespace cradle
                                     }
                                 }
 
+                                void RenderEspSettings(evo::child_t *child, cradle::modules::Module *module)
+                                {
+                                    constexpr int kGeneralPopupId = 5;
+                                    constexpr int kPerformancePopupId = 6;
+
+                                    std::vector<std::function<void(evo::popup_t *)>> general_bindings;
+                                    std::vector<std::function<void(evo::popup_t *)>> performance_bindings;
+                                    std::vector<std::function<void()>> dirty_checks;
+
+                                    auto bind_checkbox = [&](const char *setting_name, std::vector<std::function<void(evo::popup_t *)>> &bucket) {
+                                        auto *setting = module->get_setting(setting_name);
+                                        if (!setting || setting->type != cradle::modules::SettingType::BOOL)
+                                            return;
+                                        bool before = setting->value.bool_val;
+                                        bucket.emplace_back([setting](evo::popup_t *popup) {
+                                            popup->bind_checkbox(setting->name, &setting->value.bool_val);
+                                        });
+                                        dirty_checks.emplace_back([before, setting]() {
+                                            if (before != setting->value.bool_val)
+                                                cradle::config::ConfigManager::mark_dirty();
+                                        });
+                                    };
+
+                                    auto bind_slider_int = [&](const char *setting_name, std::vector<std::function<void(evo::popup_t *)>> &bucket, const char *suffix = "") {
+                                        auto *setting = module->get_setting(setting_name);
+                                        if (!setting || setting->type != cradle::modules::SettingType::INT)
+                                            return;
+                                        int before = setting->value.int_val;
+                                        int min = setting->range.int_range.min;
+                                        int max = setting->range.int_range.max;
+                                        std::string suffix_copy = suffix ? suffix : "";
+                                        bucket.emplace_back([setting, min, max, suffix_copy](evo::popup_t *popup) {
+                                            popup->bind_slider_int(setting->name, &setting->value.int_val, min, max, suffix_copy);
+                                        });
+                                        dirty_checks.emplace_back([before, setting]() {
+                                            if (before != setting->value.int_val)
+                                                cradle::config::ConfigManager::mark_dirty();
+                                        });
+                                    };
+
+                                    auto bind_slider_float = [&](const char *setting_name, std::vector<std::function<void(evo::popup_t *)>> &bucket, const char *suffix = "") {
+                                        auto *setting = module->get_setting(setting_name);
+                                        if (!setting || setting->type != cradle::modules::SettingType::FLOAT)
+                                            return;
+                                        float before = setting->value.float_val;
+                                        int min = static_cast<int>(std::floor(setting->range.float_range.min));
+                                        int max = static_cast<int>(std::ceil(setting->range.float_range.max));
+                                        if (min == max)
+                                            max = min + 1;
+                                        std::string suffix_copy = suffix ? suffix : "";
+                                        bucket.emplace_back([setting, min, max, suffix_copy](evo::popup_t *popup) {
+                                            popup->bind_slider_float(setting->name, &setting->value.float_val, min, max, suffix_copy);
+                                        });
+                                        dirty_checks.emplace_back([before, setting]() {
+                                            if (std::fabs(before - setting->value.float_val) > 0.0001f)
+                                                cradle::config::ConfigManager::mark_dirty();
+                                        });
+                                    };
+
+                                    bind_checkbox("boxes", general_bindings);
+                                    bind_checkbox("3d boxes", general_bindings);
+                                    bind_checkbox("names", general_bindings);
+                                    bind_checkbox("distance", general_bindings);
+                                    bind_checkbox("health bar", general_bindings);
+                                    bind_checkbox("head circle", general_bindings);
+                                    bind_checkbox("skeleton", general_bindings);
+                                    bind_checkbox("wall check", general_bindings);
+                                    bind_checkbox("team check", general_bindings);
+                                    bind_slider_int("esp max renders", general_bindings, " players");
+                                    bind_slider_float("max distance", general_bindings, " studs");
+
+                                    bind_slider_float("refresh ms", performance_bindings, " ms");
+                                    bind_slider_int("refresh limit", performance_bindings, " /frame");
+                                    bind_slider_float("skeleton refresh ms", performance_bindings, " ms");
+                                    bind_slider_int("skeleton max refresh per frame", performance_bindings, " /frame");
+                                    bind_slider_int("skeleton max draws per frame", performance_bindings, " draws");
+                                    bind_slider_float("skeleton max distance", performance_bindings, " studs");
+                                    bind_checkbox("skeleton visible only", performance_bindings);
+                                    bind_checkbox("wallcheck debug overlay", performance_bindings);
+
+                                    if (!general_bindings.empty())
+                                    {
+                                        auto popup = new evo::popup_t(kGeneralPopupId, "general esp");
+                                        for (auto &bind : general_bindings)
+                                            bind(popup);
+                                        child->obj(popup);
+                                    }
+                                    else
+                                    {
+                                        child->make_text("general esp controls unavailable");
+                                    }
+
+                                    if (!performance_bindings.empty())
+                                    {
+                                        auto popup = new evo::popup_t(kPerformancePopupId, "performance + skeleton");
+                                        for (auto &bind : performance_bindings)
+                                            bind(popup);
+                                        child->obj(popup);
+                                    }
+                                    else
+                                    {
+                                        child->make_text("performance controls unavailable");
+                                    }
+
+                                    for (auto &check : dirty_checks)
+                                        check();
+
+                                    child->make_text("Color pickers now live under Visual Colors → ESP");
+                                }
+
                                 void RenderVisualColorPanel(evo::child_t *child)
                                 {
-                                    child->make_text("ESP color controls");
                                     auto &manager = cradle::modules::ModuleManager::get_instance();
-                                    auto *esp_module = manager.find_module("esp");
-                                    if (!esp_module)
+
+                                    child->make_text("ESP color controls");
+                                    if (auto *esp_module = manager.find_module("esp"))
+                                    {
+                                        bool any_esp_colors = false;
+                                        for (auto &setting : esp_module->get_settings())
+                                        {
+                                            if (setting.type != cradle::modules::SettingType::COLOR)
+                                                continue;
+                                            any_esp_colors = true;
+                                            RenderColorSettingControl(child, setting);
+                                        }
+                                        if (!any_esp_colors)
+                                            child->make_text("No ESP color pickers are available right now.");
+                                    }
+                                    else
                                     {
                                         child->make_text("ESP module unavailable");
+                                    }
+
+                                    child->make_text("Aimbot color controls");
+                                    if (auto *aimbot_module = manager.find_module("aimbot"))
+                                    {
+                                        bool any_aimbot_colors = false;
+                                        for (auto &setting : aimbot_module->get_settings())
+                                        {
+                                            if (setting.type != cradle::modules::SettingType::COLOR)
+                                                continue;
+                                            any_aimbot_colors = true;
+                                            RenderColorSettingControl(child, setting);
+                                        }
+                                        if (!any_aimbot_colors)
+                                            child->make_text("No aimbot color pickers are available right now.");
+                                    }
+                                    else
+                                    {
+                                        child->make_text("Aimbot module unavailable");
+                                    }
+                                }
+
+                                void RenderCheatIndicator()
+                                {
+                                    ImGuiViewport *viewport = ImGui::GetMainViewport();
+                                    if (!viewport)
                                         return;
+                                    ImDrawList *indicator_draw_list = ImGui::GetForegroundDrawList();
+                                    if (!indicator_draw_list)
+                                        return;
+
+                                    auto &manager = cradle::modules::ModuleManager::get_instance();
+                                    const float padding = 8.0f;
+                                    const float spacing = 4.0f;
+                                    float max_text_width = 0.0f;
+                                    std::array<std::string, kCheatIndicatorCount> labels{};
+                                    std::array<ImU32, kCheatIndicatorCount> colors{};
+
+                                    for (std::size_t i = 0; i < kCheatIndicatorCount; ++i)
+                                    {
+                                        auto *module = manager.find_module(kCheatIndicatorEntries[i].module_name);
+                                        bool available = module != nullptr;
+                                        bool active = available && module->is_enabled();
+                                        const char *state = available ? (active ? "ON" : "OFF") : "N/A";
+                                        labels[i] = std::string(kCheatIndicatorEntries[i].label) + ": " + state;
+                                        ImVec2 size = ImGui::CalcTextSize(labels[i].c_str());
+                                        max_text_width = std::max(max_text_width, size.x);
+
+                                        if (!available)
+                                            colors[i] = IM_COL32(180, 180, 180, 255);
+                                        else if (active)
+                                            colors[i] = IM_COL32(120, 230, 140, 255);
+                                        else
+                                            colors[i] = IM_COL32(235, 95, 95, 255);
                                     }
 
-                                    bool any_colors = false;
-                                    for (auto &setting : esp_module->get_settings())
-                                    {
-                                        if (setting.type != cradle::modules::SettingType::COLOR)
-                                            continue;
-                                        any_colors = true;
-                                        RenderColorSettingControl(child, setting);
-                                    }
+                                    float line_height = ImGui::GetFontSize();
+                                    float box_width = max_text_width + padding * 2.0f;
+                                    float box_height = kCheatIndicatorCount * line_height + (kCheatIndicatorCount - 1) * spacing + padding * 2.0f;
 
-                                    if (!any_colors)
+                                    ImVec2 top_right(
+                                        viewport->Pos.x + viewport->Size.x - box_width - 18.0f,
+                                        viewport->Pos.y + 18.0f);
+                                    ImVec2 bottom_right(top_right.x + box_width, top_right.y + box_height);
+
+                                    indicator_draw_list->AddRectFilled(top_right, bottom_right, IM_COL32(12, 12, 12, 205), 6.0f);
+                                    indicator_draw_list->AddRect(top_right, bottom_right, IM_COL32(255, 255, 255, 35), 6.0f, 0, 1.0f);
+
+                                    float y = top_right.y + padding;
+                                    for (std::size_t i = 0; i < kCheatIndicatorCount; ++i)
                                     {
-                                        child->make_text("No color pickers are available for ESP right now.");
+                                        ImVec2 pos(top_right.x + padding, y);
+                                        indicator_draw_list->AddText(pos, colors[i], labels[i].c_str());
+                                        y += line_height + spacing;
                                     }
                                 }
 
@@ -1214,6 +1418,8 @@ namespace cradle
                                 }
                                 manager.update_all();
                                 manager.render_all();
+
+                                RenderCheatIndicator();
 
                                 if (menu_visible)
                                 {

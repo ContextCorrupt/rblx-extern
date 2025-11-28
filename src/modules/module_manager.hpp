@@ -124,7 +124,8 @@ namespace cradle::modules
 
             for (auto &m : modules)
             {
-                if (!m->is_enabled())
+                bool enabled = m->is_enabled();
+                if (!enabled && !m->allow_render_when_disabled())
                     continue;
 
                 auto start = clock::now();

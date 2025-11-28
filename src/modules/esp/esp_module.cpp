@@ -86,6 +86,10 @@ namespace
         vector3 head_world{};
         vector3 chest_world{};
         vector3 pelvis_world{};
+    vector3 hrp_center{};
+    vector3 hrp_half{};
+    matrix3 hrp_rotation{};
+    bool hrp_bounds_valid = false;
         std::array<vector3, 32> points{};
         std::size_t point_count = 0;
         float cached_health = 100.0f;
@@ -325,6 +329,18 @@ namespace
         capture_geometry(chest_part, chest_geom);
         capture_geometry(pelvis_part, pelvis_geom);
         capture_geometry(hrp_part, hrp_geom);
+
+        if (hrp_geom.valid)
+        {
+            cached.hrp_bounds_valid = true;
+            cached.hrp_center = hrp_geom.position;
+            cached.hrp_rotation = hrp_geom.rotation;
+            cached.hrp_half = hrp_geom.half;
+        }
+        else
+        {
+            cached.hrp_bounds_valid = false;
+        }
 
         vector3 head_center = head_geom.valid ? head_geom.position : (head_part.is_valid() ? head_part.get_pos() : hrp_pos + vector3(0.0f, 2.3f, 0.0f));
         vector3 chest_center = chest_geom.valid ? chest_geom.position : (chest_part.is_valid() ? chest_part.get_pos() : hrp_pos);
@@ -680,12 +696,18 @@ ESPModule::ESPModule()
     : Module("esp", "render player overlays")
 {
     settings.push_back(Setting("boxes", true));
+    settings.push_back(Setting("3d boxes", false));
     settings.push_back(Setting("names", true));
     settings.push_back(Setting("distance", true));
     settings.push_back(Setting("health bar", true));
     settings.push_back(Setting("head circle", true));
     settings.push_back(Setting("head circle color", 1.0f, 1.0f, 1.0f, 1.0f));
     settings.push_back(Setting("skeleton", false));
+    settings.push_back(Setting("skeleton refresh ms", 150.0f, 50.0f, 1000.0f));
+    settings.push_back(Setting("skeleton max refresh per frame", 3, 1, 16));
+    settings.push_back(Setting("skeleton max distance", 600.0f, 0.0f, 5000.0f));
+    settings.push_back(Setting("skeleton visible only", true));
+    settings.push_back(Setting("skeleton max draws per frame", 10, 1, 64));
     settings.push_back(Setting("visible color", 0.0f, 1.0f, 0.0f, 1.0f));
     settings.push_back(Setting("hidden color", 1.0f, 0.0f, 0.0f, 1.0f));
     settings.push_back(Setting("wall check", true));
@@ -702,12 +724,18 @@ void ESPModule::on_render()
     auto now = std::chrono::steady_clock::now();
 
     auto box_setting = get_setting("boxes");
+    auto box3d_setting = get_setting("3d boxes");
     auto name_setting = get_setting("names");
     auto distance_setting = get_setting("distance");
     auto health_bar_setting = get_setting("health bar");
     auto head_circle_setting = get_setting("head circle");
     auto head_circle_color_setting = get_setting("head circle color");
     auto skeleton_setting = get_setting("skeleton");
+    auto skeleton_refresh_ms_setting = get_setting("skeleton refresh ms");
+    auto skeleton_refresh_budget_setting = get_setting("skeleton max refresh per frame");
+    auto skeleton_max_distance_setting = get_setting("skeleton max distance");
+    auto skeleton_visible_only_setting = get_setting("skeleton visible only");
+    auto skeleton_draw_limit_setting = get_setting("skeleton max draws per frame");
     auto visible_color = get_setting("visible color");
     auto hidden_color = get_setting("hidden color");
     auto wallcheck_setting = get_setting("wall check");
@@ -744,6 +772,21 @@ void ESPModule::on_render()
     float base_refresh_ms = static_cast<float>(refresh_interval.count());
     base_refresh_ms = std::max(base_refresh_ms, 1.0f);
 
+    float skeleton_refresh_ms = skeleton_refresh_ms_setting ? skeleton_refresh_ms_setting->value.float_val : 150.0f;
+    skeleton_refresh_ms = std::clamp(skeleton_refresh_ms, 50.0f, 1500.0f);
+
+    std::size_t skeleton_refresh_budget = 3;
+    if (skeleton_refresh_budget_setting)
+        skeleton_refresh_budget = std::max(1, skeleton_refresh_budget_setting->value.int_val);
+
+    float skeleton_max_distance = skeleton_max_distance_setting ? skeleton_max_distance_setting->value.float_val : 600.0f;
+    skeleton_max_distance = std::max(0.0f, skeleton_max_distance);
+
+    bool skeleton_visible_only = skeleton_visible_only_setting ? skeleton_visible_only_setting->value.bool_val : true;
+    std::size_t skeleton_draw_limit = 10;
+    if (skeleton_draw_limit_setting)
+        skeleton_draw_limit = static_cast<std::size_t>(std::clamp(skeleton_draw_limit_setting->value.int_val, 1, 64));
+
     struct FrameProfiler
     {
         std::size_t attempts = 0;
@@ -754,12 +797,13 @@ void ESPModule::on_render()
     FrameProfiler frame_profiler;
 
     const bool draw_box = box_setting && box_setting->value.bool_val;
+    const bool draw_box3d = box3d_setting && box3d_setting->value.bool_val;
     const bool draw_name = name_setting && name_setting->value.bool_val;
     const bool draw_distance = distance_setting && distance_setting->value.bool_val;
     const bool draw_health = health_bar_setting && health_bar_setting->value.bool_val;
     const bool draw_head_circle = head_circle_setting && head_circle_setting->value.bool_val;
     const bool draw_skeleton = skeleton_setting && skeleton_setting->value.bool_val;
-    if (!(draw_box || draw_name || draw_distance || draw_health || draw_head_circle || draw_skeleton))
+    if (!(draw_box || draw_box3d || draw_name || draw_distance || draw_health || draw_head_circle || draw_skeleton))
         return;
 
     bool team_check = team_check_setting && team_check_setting->value.bool_val;
@@ -826,6 +870,8 @@ void ESPModule::on_render()
             ordered_players.reserve(players.size());
 
             std::size_t snapshot_players = players.size();
+            std::size_t skeleton_refreshes_this_frame = 0;
+            std::size_t skeleton_draws_this_frame = 0;
 
             for (std::size_t idx = 0; idx < players.size(); ++idx)
             {
@@ -1007,32 +1053,111 @@ void ESPModule::on_render()
                     rendered_this_player = true;
                 }
 
+                if (draw_box3d && cached.hrp_bounds_valid)
+                {
+                    constexpr int kCornerSigns[8][3] = {
+                        {-1, -1, -1},
+                        {1, -1, -1},
+                        {1, 1, -1},
+                        {-1, 1, -1},
+                        {-1, -1, 1},
+                        {1, -1, 1},
+                        {1, 1, 1},
+                        {-1, 1, 1}};
+
+                    std::array<ImVec2, 8> projected{};
+                    std::array<bool, 8> projected_valid{};
+
+                    for (int i = 0; i < 8; ++i)
+                    {
+                        vector3 corner_local(
+                            cached.hrp_half.X * static_cast<float>(kCornerSigns[i][0]),
+                            cached.hrp_half.Y * static_cast<float>(kCornerSigns[i][1]),
+                            cached.hrp_half.Z * static_cast<float>(kCornerSigns[i][2]));
+                        vector3 rotated = cached.hrp_rotation.multiply(corner_local);
+                        vector3 world = cached.hrp_center + rotated;
+                        vector2 screen = world_to_screen(world, view_matrix, screen_size);
+                        if (screen.X == -1 || screen.Y == -1)
+                        {
+                            projected_valid[i] = false;
+                            continue;
+                        }
+                        projected[i] = ImVec2(screen.X + client_offset_x, screen.Y + client_offset_y);
+                        projected_valid[i] = true;
+                    }
+
+                    const float box3d_thickness = std::clamp(raw_height * 0.0020f + 0.8f, 0.75f, 2.5f);
+                    auto draw_edge = [&](int a, int b) {
+                        if (!projected_valid[a] || !projected_valid[b])
+                            return;
+                        draw_list->AddLine(projected[a], projected[b], scale_color(state_color), box3d_thickness);
+                    };
+
+                    draw_edge(0, 1);
+                    draw_edge(1, 2);
+                    draw_edge(2, 3);
+                    draw_edge(3, 0);
+                    draw_edge(4, 5);
+                    draw_edge(5, 6);
+                    draw_edge(6, 7);
+                    draw_edge(7, 4);
+                    draw_edge(0, 4);
+                    draw_edge(1, 5);
+                    draw_edge(2, 6);
+                    draw_edge(3, 7);
+
+                    rendered_this_player = true;
+                }
+
                 if (draw_skeleton)
                 {
-                    constexpr float kMinSkeletonHeight = 14.0f;
-                    if (raw_height >= kMinSkeletonHeight)
+                    constexpr float kSkeletonMinHeight = 14.0f;
+                    bool allow_skeleton = raw_height >= kSkeletonMinHeight;
+                    if (allow_skeleton && skeleton_max_distance > 0.0f && distance > skeleton_max_distance)
+                        allow_skeleton = false;
+                    if (allow_skeleton && skeleton_visible_only && !cached.visible)
+                        allow_skeleton = false;
+                    if (allow_skeleton && skeleton_draw_limit > 0 && skeleton_draws_this_frame >= skeleton_draw_limit)
+                        allow_skeleton = false;
+
+                    if (allow_skeleton)
                     {
-                        auto skeleton_interval = std::max(player_refresh_interval, std::chrono::milliseconds(90));
+                        float distance_scale = 1.0f + std::min(distance / 600.0f, 3.5f);
+                        int interval_ms = static_cast<int>(std::clamp(skeleton_refresh_ms * distance_scale, 50.0f, 2000.0f));
+                        auto skeleton_interval = std::chrono::milliseconds(interval_ms);
+                        if (skeleton_interval < player_refresh_interval)
+                            skeleton_interval = player_refresh_interval;
+
                         bool need_skeleton_refresh = !cached.skeleton.world_valid ||
                                                      (now - cached.skeleton.last_update) > skeleton_interval;
 
                         BoneNodeArray bones;
                         bool have_skeleton = false;
+
                         if (need_skeleton_refresh)
                         {
-                            if (build_skeleton_world(player, bones))
+                            if (skeleton_refreshes_this_frame < skeleton_refresh_budget)
                             {
-                                cache_bone_world(bones, cached.skeleton);
-                                cached.skeleton.world_valid = true;
-                                cached.skeleton.last_update = now;
+                                if (build_skeleton_world(player, bones))
+                                {
+                                    cache_bone_world(bones, cached.skeleton);
+                                    cached.skeleton.world_valid = true;
+                                    cached.skeleton.last_update = now;
+                                    have_skeleton = true;
+                                }
+                                else
+                                {
+                                    cached.skeleton.world_valid = false;
+                                }
+                                ++skeleton_refreshes_this_frame;
+                            }
+                            else if (cached.skeleton.world_valid)
+                            {
+                                restore_bone_world(cached.skeleton, bones);
                                 have_skeleton = true;
                             }
-                            else
-                            {
-                                cached.skeleton.world_valid = false;
-                            }
                         }
-                        else
+                        else if (cached.skeleton.world_valid)
                         {
                             restore_bone_world(cached.skeleton, bones);
                             have_skeleton = true;
@@ -1053,58 +1178,47 @@ void ESPModule::on_render()
                             for (auto &node : bones)
                                 project_point(node);
 
-                            auto &head_node = get_bone(bones, SkeletonPoint::Head);
-                            auto &neck_node = get_bone(bones, SkeletonPoint::Neck);
-                            auto &collar_node = get_bone(bones, SkeletonPoint::Collar);
-                            auto &chest_node = get_bone(bones, SkeletonPoint::Chest);
-                            auto &pelvis_node = get_bone(bones, SkeletonPoint::Pelvis);
-                            auto &left_shoulder = get_bone(bones, SkeletonPoint::LeftShoulder);
-                            auto &left_elbow = get_bone(bones, SkeletonPoint::LeftElbow);
-                            auto &left_hand = get_bone(bones, SkeletonPoint::LeftHand);
-                            auto &right_shoulder = get_bone(bones, SkeletonPoint::RightShoulder);
-                            auto &right_elbow = get_bone(bones, SkeletonPoint::RightElbow);
-                            auto &right_hand = get_bone(bones, SkeletonPoint::RightHand);
-                            auto &left_hip = get_bone(bones, SkeletonPoint::LeftHip);
-                            auto &left_knee = get_bone(bones, SkeletonPoint::LeftKnee);
-                            auto &left_foot = get_bone(bones, SkeletonPoint::LeftFoot);
-                            auto &right_hip = get_bone(bones, SkeletonPoint::RightHip);
-                            auto &right_knee = get_bone(bones, SkeletonPoint::RightKnee);
-                            auto &right_foot = get_bone(bones, SkeletonPoint::RightFoot);
-
                             bool skeleton_drawn = false;
-                            auto draw_bone = [&](const BoneNode &a, const BoneNode &b) {
-                                if (!a.screen_valid || !b.screen_valid)
+                            const float skeleton_thickness = std::clamp(raw_height * 0.0022f + 0.8f, 0.75f, 2.8f);
+
+                            std::array<ImVec2, 8> polyline_buffer{};
+                            auto draw_chain = [&](std::initializer_list<SkeletonPoint> order) {
+                                int idx = 0;
+                                for (auto point : order)
+                                {
+                                    const auto &node = get_bone(bones, point);
+                                    if (!node.screen_valid)
+                                        return;
+                                    polyline_buffer[idx++] = node.screen;
+                                }
+                                if (idx >= 2)
+                                {
+                                    draw_list->AddPolyline(polyline_buffer.data(), idx, scale_color(state_color), false, skeleton_thickness);
+                                    skeleton_drawn = true;
+                                }
+                            };
+
+                            auto draw_segment = [&](SkeletonPoint a, SkeletonPoint b) {
+                                const auto &na = get_bone(bones, a);
+                                const auto &nb = get_bone(bones, b);
+                                if (!na.screen_valid || !nb.screen_valid)
                                     return;
-                                float thickness = std::clamp(raw_height * 0.0022f + 0.8f, 0.75f, 2.8f);
-                                draw_list->AddLine(a.screen, b.screen, scale_color(state_color), thickness);
+                                draw_list->AddLine(na.screen, nb.screen, scale_color(state_color), skeleton_thickness);
                                 skeleton_drawn = true;
                             };
 
-                            draw_bone(head_node, neck_node);
-                            draw_bone(neck_node, collar_node);
-                            draw_bone(collar_node, chest_node);
-                            draw_bone(chest_node, pelvis_node);
-
-                            draw_bone(collar_node, left_shoulder);
-                            draw_bone(left_shoulder, left_elbow);
-                            draw_bone(left_elbow, left_hand);
-
-                            draw_bone(collar_node, right_shoulder);
-                            draw_bone(right_shoulder, right_elbow);
-                            draw_bone(right_elbow, right_hand);
-
-                            draw_bone(left_shoulder, right_shoulder);
-
-                            draw_bone(pelvis_node, left_hip);
-                            draw_bone(left_hip, left_knee);
-                            draw_bone(left_knee, left_foot);
-
-                            draw_bone(pelvis_node, right_hip);
-                            draw_bone(right_hip, right_knee);
-                            draw_bone(right_knee, right_foot);
+                            draw_chain({SkeletonPoint::Head, SkeletonPoint::Neck, SkeletonPoint::Collar, SkeletonPoint::Chest, SkeletonPoint::Pelvis});
+                            draw_chain({SkeletonPoint::Collar, SkeletonPoint::LeftShoulder, SkeletonPoint::LeftElbow, SkeletonPoint::LeftHand});
+                            draw_chain({SkeletonPoint::Collar, SkeletonPoint::RightShoulder, SkeletonPoint::RightElbow, SkeletonPoint::RightHand});
+                            draw_chain({SkeletonPoint::Pelvis, SkeletonPoint::LeftHip, SkeletonPoint::LeftKnee, SkeletonPoint::LeftFoot});
+                            draw_chain({SkeletonPoint::Pelvis, SkeletonPoint::RightHip, SkeletonPoint::RightKnee, SkeletonPoint::RightFoot});
+                            draw_segment(SkeletonPoint::LeftShoulder, SkeletonPoint::RightShoulder);
 
                             if (skeleton_drawn)
+                            {
                                 rendered_this_player = true;
+                                ++skeleton_draws_this_frame;
+                            }
                         }
                     }
                 }

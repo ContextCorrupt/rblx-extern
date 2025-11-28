@@ -1,7 +1,7 @@
 #include "../../../inc.hpp"
+#include <array>
 
-static auto str_idx_color = -1;
-static bool state_color = false;
+static std::array<bool, 1000> g_popup_state{};
 inline static auto str_index_dropdown = -1;
 inline static bool state_dropdown = false;
 inline static int time_dropdown;
@@ -247,26 +247,29 @@ void evo::popup_t::paint( ) {
 }
 
 void evo::popup_t::input( ) { 
-	if ( _container->can_interact( ) && _input->mouse_in_box( { this->base_window.x, this->base_window.y }, { ( float )_container->group_width, 30 } )
-		 && _input->key_pressed( VK_LBUTTON ) && !_container->base_handler[ 3 ] ) {
-		state_color = !state_color;
-		str_idx_color = _container->get_id( );
+	bool header_hovered = _input->mouse_in_box( { this->base_window.x, this->base_window.y }, { ( float )_container->group_width, 30 } );
+	if ( _container->can_interact( ) && header_hovered && _input->key_pressed( VK_LBUTTON ) && !_container->base_handler[ 3 ] ) {
+		g_popup_state[ this->pop_id ] = !g_popup_state[ this->pop_id ];
 	}
 
-	if ( str_idx_color == _container->get_id( ) ) {
-		/* we can now use this shit */
-		this->focused_element = state_color;
+	bool full_bounds_hovered = _input->mouse_in_box( { this->base_window.x, this->base_window.y }, { ( float )_container->group_width, 30 + ( float )elem_height[ this->pop_id ] } );
+	if ( g_popup_state[ this->pop_id ] && !full_bounds_hovered && _input->key_pressed( VK_LBUTTON ) ) {
+		g_popup_state[ this->pop_id ] = false;
 	}
 
-	if ( str_idx_color == _container->get_id( ) && !_input->mouse_in_box( { this->base_window.x, this->base_window.y }, { (float)_container->group_width, 30 + (float)elem_height[ this->pop_id ] } )
-		 && _input->key_pressed( VK_LBUTTON ) ) {
-		state_color = false;
+	this->focused_element = g_popup_state[ this->pop_id ];
+
+	bool any_open = false;
+	for ( bool state : g_popup_state ) {
+		if ( state ) {
+			any_open = true;
+			break;
+		}
 	}
 
-	_container->base_handler[ 0 ] = state_color;
+	_container->base_handler[ 0 ] = any_open;
 	_container->base_opened_state[ _container->base_handler_t::colorpicker ][ _container->get_id( ) ] = this->focused_element;
-
-	this->hovered = _input->mouse_in_box( { this->base_window.x, this->base_window.y }, { ( float )_container->group_width, 30 + ( float )elem_height[ this->pop_id ] });
+	this->hovered = full_bounds_hovered;
 }
 
 void evo::popup_t::bind_checkbox( std::string label, bool* value ) {
