@@ -5,6 +5,78 @@
 #include <cstring>
 #include <spdlog/spdlog.h>
 
+namespace
+{
+    constexpr std::size_t kRobloxInlineStringThreshold = 16;
+    constexpr std::size_t kRobloxMaxStringLength = 512;
+
+    std::string read_ascii_string(uintptr_t address, std::size_t max_len)
+    {
+        if (!cradle::memory::IsValid(address))
+            return {};
+
+        std::string result;
+        result.reserve(std::min<std::size_t>(max_len, 32));
+
+        for (std::size_t i = 0; i < max_len; ++i)
+        {
+            char c = cradle::memory::read<char>(address + i);
+            if (c == '\0')
+                break;
+            result.push_back(c);
+        }
+
+        return result;
+    }
+
+    std::string read_roblox_string(uintptr_t string_ptr)
+    {
+        if (!cradle::memory::IsValid(string_ptr))
+            return {};
+
+        auto safe_length = [&](uintptr_t offset) -> std::uint32_t {
+            if (!cradle::memory::IsValid(string_ptr + offset))
+                return 0;
+            return cradle::memory::read<std::uint32_t>(string_ptr + offset);
+        };
+
+        std::uint32_t declared_length = safe_length(0x10);
+        if (declared_length == 0 || declared_length > kRobloxMaxStringLength)
+        {
+            std::uint32_t alt = safe_length(0x18);
+            if (alt > 0 && alt <= kRobloxMaxStringLength)
+                declared_length = alt;
+        }
+
+        std::size_t max_read = declared_length > 0 ? std::min<std::size_t>(declared_length + 1, kRobloxMaxStringLength) : kRobloxMaxStringLength;
+        bool prefer_inline = declared_length > 0 && declared_length < kRobloxInlineStringThreshold;
+
+        if (prefer_inline)
+        {
+            auto inline_value = read_ascii_string(string_ptr, max_read);
+            if (!inline_value.empty())
+                return inline_value;
+        }
+
+        auto heap_ptr = cradle::memory::read<uintptr_t>(string_ptr);
+        if (cradle::memory::IsValid(heap_ptr))
+        {
+            auto heap_value = read_ascii_string(heap_ptr, max_read);
+            if (!heap_value.empty())
+                return heap_value;
+        }
+
+        if (!prefer_inline)
+        {
+            auto fallback = read_ascii_string(string_ptr, kRobloxInlineStringThreshold);
+            if (!fallback.empty())
+                return fallback;
+        }
+
+        return {};
+    }
+}
+
 namespace cradle::engine
 {
 
@@ -14,18 +86,10 @@ namespace cradle::engine
             return "null";
 
         std::uint64_t name_ptr = cradle::memory::read<std::uint64_t>(address + Offsets::Instance::Name);
-        if (!name_ptr || name_ptr < 0x10000)
+        auto name = read_roblox_string(name_ptr);
+        if (name.empty())
             return "unknown";
-
-        char buffer[256] = {};
-        for (int i = 0; i < 255; i++)
-        {
-            char c = cradle::memory::read<char>(name_ptr + i);
-            if (c == '\0')
-                break;
-            buffer[i] = c;
-        }
-        return std::string(buffer);
+        return name;
     }
 
     std::string Instance::get_class_name() const
@@ -38,18 +102,10 @@ namespace cradle::engine
             return "unknown";
 
         std::uint64_t class_name_ptr = cradle::memory::read<std::uint64_t>(class_descriptor + Offsets::Instance::ClassName);
-        if (!class_name_ptr || class_name_ptr < 0x10000)
+        auto cls = read_roblox_string(class_name_ptr);
+        if (cls.empty())
             return "unknown";
-
-        char buffer[256] = {};
-        for (int i = 0; i < 255; i++)
-        {
-            char c = cradle::memory::read<char>(class_name_ptr + i);
-            if (c == '\0')
-                break;
-            buffer[i] = c;
-        }
-        return std::string(buffer);
+        return cls;
     }
 
     std::vector<Instance> Instance::get_children()
@@ -291,14 +347,9 @@ namespace cradle::engine
         if (!name_ptr || name_ptr < 0x10000)
             return "Unknown";
 
-        char buffer[256] = {};
-        for (int i = 0; i < 255; i++)
-        {
-            char c = cradle::memory::read<char>(name_ptr + i);
-            if (c == '\0')
-                break;
-            buffer[i] = c;
-        }
-        return std::string(buffer);
+        auto team_name = read_roblox_string(name_ptr);
+        if (team_name.empty())
+            return "Unknown";
+        return team_name;
     }
 }
