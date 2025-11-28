@@ -1,0 +1,53 @@
+Detecting compiler hash for triplet x64-windows...
+Compiler found: C:/Program Files/Microsoft Visual Studio/2022/Community/VC/Tools/MSVC/14.44.35207/bin/Hostx64/x64/cl.exe
+The following packages will be built and installed:
+    fmt:x64-windows@12.1.0
+    imgui:x64-windows@1.91.9
+    spdlog:x64-windows@1.16.0
+  * vcpkg-cmake:x64-windows@2024-04-23
+  * vcpkg-cmake-config:x64-windows@2024-05-23
+Additional packages (*) will be modified to complete this operation.
+Restored 5 package(s) from C:\Users\vzsol\AppData\Local\vcpkg\archives in 108 ms. Use --debug to see more details.
+Installing 1/5 vcpkg-cmake-config:x64-windows@2024-05-23...
+Elapsed time to handle vcpkg-cmake-config:x64-windows: 2.6 ms
+vcpkg-cmake-config:x64-windows package ABI: f536d4605c73c466b9c52c4405f17f6a4fb5ff2de8ea1afa7afa3e5b68e7aab7
+Installing 2/5 vcpkg-cmake:x64-windows@2024-04-23...
+Elapsed time to handle vcpkg-cmake:x64-windows: 2.64 ms
+vcpkg-cmake:x64-windows package ABI: 4240bdb0abcbf79389778317b042b42908cb1a6ddb55c186153dd6123395fadb
+Installing 3/5 fmt:x64-windows@12.1.0...
+Elapsed time to handle fmt:x64-windows: 6.63 ms
+fmt:x64-windows package ABI: ef21141538ca60df3fb05080aa8bcf83db4955482eb18c05658ebebbdd87c623
+Installing 4/5 imgui:x64-windows@1.91.9...
+Elapsed time to handle imgui:x64-windows: 4.22 ms
+imgui:x64-windows package ABI: 189a475611f11cd9b2d18e46e54e82bbeba251130539fea136e3cce8ccc1e9c2
+Installing 5/5 spdlog:x64-windows@1.16.0...
+Elapsed time to handle spdlog:x64-windows: 16.9 ms
+spdlog:x64-windows package ABI: caa1ecc8c3fce5f1bea27ba96e2f7e2ad43997dad9337bc1627f1ff5fbcc49d1
+Installed contents are licensed to you by owners. Microsoft is not responsible for, nor does it grant any licenses to, third-party packages.
+Packages installed in this vcpkg installation declare the following licenses:
+MIT
+The package fmt provides CMake targets:
+
+    find_package(fmt CONFIG REQUIRED)
+    target_link_libraries(main PRIVATE fmt::fmt)
+
+    # Or use the header-only version
+    find_package(fmt CONFIG REQUIRED)
+    target_link_libraries(main PRIVATE fmt::fmt-header-only)
+
+imgui provides CMake targets:
+
+  # this is heuristically generated, and may not be correct
+  find_package(imgui CONFIG REQUIRED)
+  target_link_libraries(main PRIVATE imgui::imgui)
+
+The package spdlog provides CMake targets:
+
+    find_package(spdlog CONFIG REQUIRED)
+    target_link_libraries(main PRIVATE spdlog::spdlog)
+
+    # Or use the header-only version
+    find_package(spdlog CONFIG REQUIRED)
+    target_link_libraries(main PRIVATE spdlog::spdlog_header_only)
+
+All requested installations completed successfully in: 34.2 ms

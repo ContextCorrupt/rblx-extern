@@ -1,0 +1,10 @@
+{
+  "name": "mossad-is",
+  "version-string": "1.0.0",
+  "dependencies": [
+    "spdlog",
+    "imgui",
+    "fmt",
+    "freetype"
+  ]
+}

@@ -1,0 +1,46 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="18.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup>
+    <ClCompile Include="C:\cradle-main\cradle-main\src\cache\player_cache.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="C:\cradle-main\cradle-main\src\core\cradle.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="C:\cradle-main\cradle-main\src\main.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="C:\cradle-main\cradle-main\src\modules\aimbot\aimbot_module.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="C:\cradle-main\cradle-main\src\modules\esp\esp_module.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="C:\cradle-main\cradle-main\src\modules\triggerbot\triggerbot_module.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="C:\cradle-main\cradle-main\src\overlay\overlay.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="C:\cradle-main\cradle-main\src\util\engine\datamodel\datamodel.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="C:\cradle-main\cradle-main\src\util\engine\instance\instance.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="C:\cradle-main\cradle-main\src\util\engine\visualengine\visualengine.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="C:\cradle-main\cradle-main\src\util\engine\wallcheck\wallcheck.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+  </ItemGroup>
+  <ItemGroup>
+    <CustomBuild Include="C:\cradle-main\cradle-main\CMakeLists.txt" />
+  </ItemGroup>
+  <ItemGroup>
+    <Filter Include="Source Files">
+      <UniqueIdentifier>{1C358DC0-02F4-3DAB-8D9A-3E2762094C30}</UniqueIdentifier>
+    </Filter>
+  </ItemGroup>
+</Project>
