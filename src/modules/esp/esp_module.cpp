@@ -45,6 +45,36 @@ namespace
         bool valid{false};
     };
 
+    enum class SkeletonPoint : std::size_t
+    {
+        Head = 0,
+        Neck,
+        Collar,
+        Chest,
+        Pelvis,
+        LeftShoulder,
+        LeftElbow,
+        LeftHand,
+        RightShoulder,
+        RightElbow,
+        RightHand,
+        LeftHip,
+        LeftKnee,
+        LeftFoot,
+        RightHip,
+        RightKnee,
+        RightFoot,
+        Count
+    };
+
+    struct CachedSkeleton
+    {
+        bool world_valid = false;
+        std::array<vector3, static_cast<std::size_t>(SkeletonPoint::Count)> world_points{};
+        std::array<bool, static_cast<std::size_t>(SkeletonPoint::Count)> point_valid{};
+        std::chrono::steady_clock::time_point last_update{};
+    };
+
     struct CachedVisual
     {
         bool valid = false;
@@ -63,9 +93,52 @@ namespace
         std::chrono::steady_clock::time_point last_health_sample{};
         std::chrono::steady_clock::time_point last_update{};
         std::chrono::steady_clock::time_point last_seen{};
+        CachedSkeleton skeleton;
     };
 
     std::unordered_map<std::uint64_t, CachedVisual> g_cached_visuals;
+
+    struct BoneNode
+    {
+        vector3 world{};
+        ImVec2 screen{0.0f, 0.0f};
+        bool world_valid = false;
+        bool screen_valid = false;
+    };
+
+    using BoneNodeArray = std::array<BoneNode, static_cast<std::size_t>(SkeletonPoint::Count)>;
+
+    static BoneNode &get_bone(BoneNodeArray &nodes, SkeletonPoint point)
+    {
+        return nodes[static_cast<std::size_t>(point)];
+    }
+
+    static void reset_bones(BoneNodeArray &nodes)
+    {
+        for (auto &node : nodes)
+            node = BoneNode{};
+    }
+
+    static void cache_bone_world(const BoneNodeArray &nodes, CachedSkeleton &cache)
+    {
+        cache.world_valid = false;
+        for (std::size_t i = 0; i < nodes.size(); ++i)
+        {
+            cache.world_points[i] = nodes[i].world;
+            cache.point_valid[i] = nodes[i].world_valid;
+            cache.world_valid = cache.world_valid || nodes[i].world_valid;
+        }
+    }
+
+    static void restore_bone_world(const CachedSkeleton &cache, BoneNodeArray &nodes)
+    {
+        for (std::size_t i = 0; i < nodes.size(); ++i)
+        {
+            nodes[i].world = cache.world_points[i];
+            nodes[i].world_valid = cache.point_valid[i];
+            nodes[i].screen_valid = false;
+        }
+    }
 
     double s_profile_refresh_ms = 0.0;
     double s_profile_attempts = 0.0;
@@ -349,6 +422,257 @@ namespace
         }
 
         return true;
+    }
+
+    bool build_skeleton_world(const engine::Player &player, BoneNodeArray &nodes)
+    {
+        reset_bones(nodes);
+
+        auto set_node_from_part = [&](BoneNode &node, const engine::Instance &inst, const PartGeometry &geom, const vector3 &offset) -> bool {
+            vector3 point;
+            if (sample_from_geometry(geom, offset, point))
+            {
+                node.world = point;
+                node.world_valid = true;
+                return true;
+            }
+            if (geom.valid)
+            {
+                node.world = geom.position;
+                node.world_valid = true;
+                return true;
+            }
+            if (inst.is_valid())
+            {
+                node.world = inst.get_pos();
+                node.world_valid = true;
+                return true;
+            }
+            return false;
+        };
+
+        auto head_part = resolve_part(player, player.head, {"Head"});
+        auto chest_part = resolve_part(player, player.upper_torso, {"UpperTorso", "Torso", "HumanoidRootPart"});
+        auto pelvis_part = resolve_part(player, player.lower_torso, {"LowerTorso", "Torso", "HumanoidRootPart"});
+        auto hrp_part = resolve_part(player, player.hrp,
+                                     player.rig_type == 1 ? std::initializer_list<const char *>{"HumanoidRootPart", "Hitbox", "UpperTorso"}
+                                                          : std::initializer_list<const char *>{"Torso", "HumanoidRootPart", "UpperTorso"});
+
+        if (!chest_part.is_valid())
+            chest_part = hrp_part;
+        if (!pelvis_part.is_valid())
+            pelvis_part = hrp_part;
+
+        PartGeometry head_geom, chest_geom, pelvis_geom, hrp_geom;
+        capture_geometry(head_part, head_geom);
+        capture_geometry(chest_part, chest_geom);
+        capture_geometry(pelvis_part, pelvis_geom);
+        capture_geometry(hrp_part, hrp_geom);
+
+        auto &head_node = get_bone(nodes, SkeletonPoint::Head);
+        set_node_from_part(head_node, head_part, head_geom, vector3(0.0f, 0.0f, 0.0f));
+
+        auto &neck_node = get_bone(nodes, SkeletonPoint::Neck);
+        if (!set_node_from_part(neck_node, chest_part, chest_geom, vector3(0.0f, 0.9f, 0.0f)))
+        {
+            if (head_node.world_valid)
+                set_node_from_part(neck_node, head_part, head_geom, vector3(0.0f, -0.8f, 0.0f));
+        }
+
+        auto &chest_node = get_bone(nodes, SkeletonPoint::Chest);
+        if (!set_node_from_part(chest_node, chest_part, chest_geom, vector3(0.0f, 0.1f, 0.0f)) && hrp_geom.valid)
+            set_node_from_part(chest_node, hrp_part, hrp_geom, vector3(0.0f, 0.1f, 0.0f));
+
+        auto &pelvis_node = get_bone(nodes, SkeletonPoint::Pelvis);
+        if (!set_node_from_part(pelvis_node, pelvis_part, pelvis_geom, vector3(0.0f, -0.2f, 0.0f)))
+            pelvis_node = chest_node;
+
+        if (!neck_node.world_valid && head_node.world_valid && chest_node.world_valid)
+        {
+            neck_node.world = chest_node.world + (head_node.world - chest_node.world) * 0.35f;
+            neck_node.world_valid = true;
+        }
+
+        auto &collar_node = get_bone(nodes, SkeletonPoint::Collar);
+        if (neck_node.world_valid)
+        {
+            collar_node = neck_node;
+            collar_node.world.Y -= 0.08f;
+            collar_node.world_valid = true;
+        }
+        else if (chest_node.world_valid)
+        {
+            collar_node = chest_node;
+            collar_node.world_valid = true;
+        }
+
+        auto left_upper_arm = resolve_part(player, player.left_upper_arm, {"LeftUpperArm", "Left Arm"});
+        auto right_upper_arm = resolve_part(player, player.right_upper_arm, {"RightUpperArm", "Right Arm"});
+        auto left_lower_arm = resolve_part(player, player.left_lower_arm, {"LeftLowerArm", "Left Arm"});
+        auto right_lower_arm = resolve_part(player, player.right_lower_arm, {"RightLowerArm", "Right Arm"});
+        auto left_hand_part = resolve_part(player, player.left_hand, {"LeftHand", "Left Arm", "LeftLowerArm"});
+        auto right_hand_part = resolve_part(player, player.right_hand, {"RightHand", "Right Arm", "RightLowerArm"});
+
+        PartGeometry left_upper_arm_geom, right_upper_arm_geom, left_lower_arm_geom, right_lower_arm_geom, left_hand_geom, right_hand_geom;
+        capture_geometry(left_upper_arm, left_upper_arm_geom);
+        capture_geometry(right_upper_arm, right_upper_arm_geom);
+        capture_geometry(left_lower_arm, left_lower_arm_geom);
+        capture_geometry(right_lower_arm, right_lower_arm_geom);
+        capture_geometry(left_hand_part, left_hand_geom);
+        capture_geometry(right_hand_part, right_hand_geom);
+
+        auto left_upper_leg = resolve_part(player, player.left_upper_leg, {"LeftUpperLeg", "Left Leg"});
+        auto right_upper_leg = resolve_part(player, player.right_upper_leg, {"RightUpperLeg", "Right Leg"});
+        auto left_lower_leg = resolve_part(player, player.left_lower_leg, {"LeftLowerLeg", "Left Leg"});
+        auto right_lower_leg = resolve_part(player, player.right_lower_leg, {"RightLowerLeg", "Right Leg"});
+        auto left_foot_part = resolve_part(player, player.left_foot, {"LeftFoot", "Left Leg", "LeftLowerLeg"});
+        auto right_foot_part = resolve_part(player, player.right_foot, {"RightFoot", "Right Leg", "RightLowerLeg"});
+
+        PartGeometry left_upper_leg_geom, right_upper_leg_geom, left_lower_leg_geom, right_lower_leg_geom, left_foot_geom, right_foot_geom;
+        capture_geometry(left_upper_leg, left_upper_leg_geom);
+        capture_geometry(right_upper_leg, right_upper_leg_geom);
+        capture_geometry(left_lower_leg, left_lower_leg_geom);
+        capture_geometry(right_lower_leg, right_lower_leg_geom);
+        capture_geometry(left_foot_part, left_foot_geom);
+        capture_geometry(right_foot_part, right_foot_geom);
+
+        auto &left_shoulder = get_bone(nodes, SkeletonPoint::LeftShoulder);
+        auto &right_shoulder = get_bone(nodes, SkeletonPoint::RightShoulder);
+        if (!set_node_from_part(left_shoulder, left_upper_arm, left_upper_arm_geom, vector3(0.0f, 1.0f, 0.0f)))
+            set_node_from_part(left_shoulder, chest_part, chest_geom, vector3(0.85f, 0.4f, 0.0f));
+        if (!set_node_from_part(right_shoulder, right_upper_arm, right_upper_arm_geom, vector3(0.0f, 1.0f, 0.0f)))
+            set_node_from_part(right_shoulder, chest_part, chest_geom, vector3(-0.85f, 0.4f, 0.0f));
+
+        auto align_shoulder_height = [&](BoneNode &shoulder, float fallback_sign) {
+            if (!shoulder.world_valid && collar_node.world_valid)
+            {
+                shoulder.world = collar_node.world + vector3(fallback_sign * 0.42f, 0.0f, 0.0f);
+                shoulder.world_valid = true;
+            }
+            if (shoulder.world_valid && collar_node.world_valid)
+                shoulder.world.Y = collar_node.world.Y;
+            else if (shoulder.world_valid && neck_node.world_valid)
+                shoulder.world.Y = neck_node.world.Y;
+        };
+
+        align_shoulder_height(left_shoulder, 1.0f);
+        align_shoulder_height(right_shoulder, -1.0f);
+
+        auto &left_elbow = get_bone(nodes, SkeletonPoint::LeftElbow);
+        auto &right_elbow = get_bone(nodes, SkeletonPoint::RightElbow);
+        auto &left_hand = get_bone(nodes, SkeletonPoint::LeftHand);
+        auto &right_hand = get_bone(nodes, SkeletonPoint::RightHand);
+
+        auto build_arm_chain = [&](const engine::Instance &upper_inst, const PartGeometry &upper_geom,
+                                   const engine::Instance &lower_inst, const PartGeometry &lower_geom,
+                                   const engine::Instance &hand_inst, const PartGeometry &hand_geom,
+                                   BoneNode &shoulder, BoneNode &elbow, BoneNode &hand_node) {
+            (void)upper_inst;
+            (void)lower_inst;
+            vector3 joint_point;
+            if (!elbow.world_valid && sample_from_geometry(upper_geom, vector3(0.0f, -1.0f, 0.0f), joint_point))
+            {
+                elbow.world = joint_point;
+                elbow.world_valid = true;
+            }
+            if (sample_from_geometry(lower_geom, vector3(0.0f, 1.0f, 0.0f), joint_point))
+            {
+                if (elbow.world_valid)
+                    elbow.world = (elbow.world + joint_point) * 0.5f;
+                else
+                {
+                    elbow.world = joint_point;
+                    elbow.world_valid = true;
+                }
+            }
+            if (sample_from_geometry(lower_geom, vector3(0.0f, -1.0f, 0.0f), joint_point))
+            {
+                hand_node.world = joint_point;
+                hand_node.world_valid = true;
+            }
+            if (!hand_node.world_valid)
+                set_node_from_part(hand_node, hand_inst, hand_geom, vector3(0.0f, -0.2f, 0.0f));
+            if (!hand_node.world_valid && elbow.world_valid && shoulder.world_valid)
+            {
+                vector3 dir = elbow.world - shoulder.world;
+                if (dir.magnitude() > 0.01f)
+                {
+                    hand_node.world = elbow.world + dir;
+                    hand_node.world_valid = true;
+                }
+            }
+        };
+
+        build_arm_chain(left_upper_arm, left_upper_arm_geom, left_lower_arm, left_lower_arm_geom, left_hand_part, left_hand_geom, left_shoulder, left_elbow, left_hand);
+        build_arm_chain(right_upper_arm, right_upper_arm_geom, right_lower_arm, right_lower_arm_geom, right_hand_part, right_hand_geom, right_shoulder, right_elbow, right_hand);
+
+        auto &left_hip = get_bone(nodes, SkeletonPoint::LeftHip);
+        auto &right_hip = get_bone(nodes, SkeletonPoint::RightHip);
+        const engine::Instance &hip_anchor_inst = pelvis_part.is_valid() ? pelvis_part : chest_part;
+        const PartGeometry &hip_anchor_geom = pelvis_geom.valid ? pelvis_geom : chest_geom;
+        if (!set_node_from_part(left_hip, left_upper_leg, left_upper_leg_geom, vector3(0.0f, 1.0f, 0.0f)))
+            set_node_from_part(left_hip, hip_anchor_inst, hip_anchor_geom, vector3(0.55f, -0.4f, 0.0f));
+        if (!set_node_from_part(right_hip, right_upper_leg, right_upper_leg_geom, vector3(0.0f, 1.0f, 0.0f)))
+            set_node_from_part(right_hip, hip_anchor_inst, hip_anchor_geom, vector3(-0.55f, -0.4f, 0.0f));
+
+        auto &left_knee = get_bone(nodes, SkeletonPoint::LeftKnee);
+        auto &right_knee = get_bone(nodes, SkeletonPoint::RightKnee);
+        auto &left_foot = get_bone(nodes, SkeletonPoint::LeftFoot);
+        auto &right_foot = get_bone(nodes, SkeletonPoint::RightFoot);
+
+        auto build_leg_chain = [&](const engine::Instance &upper_inst, const PartGeometry &upper_geom,
+                                   const engine::Instance &lower_inst, const PartGeometry &lower_geom,
+                                   const engine::Instance &foot_inst, const PartGeometry &foot_geom,
+                                   BoneNode &hip, BoneNode &knee, BoneNode &foot_node) {
+            (void)upper_inst;
+            (void)lower_inst;
+            vector3 joint_point;
+            if (!knee.world_valid && sample_from_geometry(upper_geom, vector3(0.0f, -1.0f, 0.0f), joint_point))
+            {
+                knee.world = joint_point;
+                knee.world_valid = true;
+            }
+            if (sample_from_geometry(lower_geom, vector3(0.0f, 1.0f, 0.0f), joint_point))
+            {
+                if (knee.world_valid)
+                    knee.world = (knee.world + joint_point) * 0.5f;
+                else
+                {
+                    knee.world = joint_point;
+                    knee.world_valid = true;
+                }
+            }
+            if (sample_from_geometry(lower_geom, vector3(0.0f, -1.0f, 0.0f), joint_point))
+            {
+                foot_node.world = joint_point;
+                foot_node.world_valid = true;
+            }
+            if (!foot_node.world_valid)
+                set_node_from_part(foot_node, foot_inst, foot_geom, vector3(0.0f, -0.8f, 0.0f));
+            if (!foot_node.world_valid && knee.world_valid && hip.world_valid)
+            {
+                vector3 dir = knee.world - hip.world;
+                if (dir.magnitude() > 0.01f)
+                {
+                    foot_node.world = knee.world + dir;
+                    foot_node.world_valid = true;
+                }
+            }
+        };
+
+        build_leg_chain(left_upper_leg, left_upper_leg_geom, left_lower_leg, left_lower_leg_geom, left_foot_part, left_foot_geom, left_hip, left_knee, left_foot);
+        build_leg_chain(right_upper_leg, right_upper_leg_geom, right_lower_leg, right_lower_leg_geom, right_foot_part, right_foot_geom, right_hip, right_knee, right_foot);
+
+        bool any = false;
+        for (const auto &node : nodes)
+        {
+            if (node.world_valid)
+            {
+                any = true;
+                break;
+            }
+        }
+        return any;
     }
 }
 
@@ -685,307 +1009,104 @@ void ESPModule::on_render()
 
                 if (draw_skeleton)
                 {
-                    struct BoneNode
+                    constexpr float kMinSkeletonHeight = 14.0f;
+                    if (raw_height >= kMinSkeletonHeight)
                     {
-                        vector3 world;
-                        ImVec2 screen;
-                        bool world_valid = false;
-                        bool screen_valid = false;
-                    };
+                        auto skeleton_interval = std::max(player_refresh_interval, std::chrono::milliseconds(90));
+                        bool need_skeleton_refresh = !cached.skeleton.world_valid ||
+                                                     (now - cached.skeleton.last_update) > skeleton_interval;
 
-                    auto project_point = [&](BoneNode &node) {
-                        if (!node.world_valid)
-                            return;
-                        vector2 screen = world_to_screen(node.world, view_matrix, screen_size);
-                        if (screen.X == -1 || screen.Y == -1)
-                            return;
-                        node.screen = ImVec2(screen.X + client_offset_x, screen.Y + client_offset_y);
-                        node.screen_valid = true;
-                    };
-
-                    auto set_node_from_part = [&](BoneNode &node, const engine::Instance &inst, const PartGeometry &geom, const vector3 &offset) -> bool {
-                        vector3 point;
-                        if (sample_from_geometry(geom, offset, point))
+                        BoneNodeArray bones;
+                        bool have_skeleton = false;
+                        if (need_skeleton_refresh)
                         {
-                            node.world = point;
-                            node.world_valid = true;
-                            return true;
-                        }
-                        if (geom.valid)
-                        {
-                            node.world = geom.position;
-                            node.world_valid = true;
-                            return true;
-                        }
-                        if (inst.is_valid())
-                        {
-                            node.world = inst.get_pos();
-                            node.world_valid = true;
-                            return true;
-                        }
-                        return false;
-                    };
-
-                    auto head_part = resolve_part(player, player.head, {"Head"});
-                    auto chest_part = resolve_part(player, player.upper_torso, {"UpperTorso", "Torso", "HumanoidRootPart"});
-                    auto pelvis_part = resolve_part(player, player.lower_torso, {"LowerTorso", "Torso", "HumanoidRootPart"});
-                    auto hrp_part = resolve_part(player, player.hrp,
-                                                 player.rig_type == 1 ? std::initializer_list<const char *>{"HumanoidRootPart", "Hitbox", "UpperTorso"}
-                                                                      : std::initializer_list<const char *>{"Torso", "HumanoidRootPart", "UpperTorso"});
-
-                    if (!chest_part.is_valid())
-                        chest_part = hrp_part;
-                    if (!pelvis_part.is_valid())
-                        pelvis_part = hrp_part;
-
-                    PartGeometry head_geom, chest_geom, pelvis_geom, hrp_geom;
-                    capture_geometry(head_part, head_geom);
-                    capture_geometry(chest_part, chest_geom);
-                    capture_geometry(pelvis_part, pelvis_geom);
-                    capture_geometry(hrp_part, hrp_geom);
-
-                    BoneNode head_node;
-                    set_node_from_part(head_node, head_part, head_geom, vector3(0.0f, 0.0f, 0.0f));
-
-                    BoneNode neck_node;
-                    if (!set_node_from_part(neck_node, chest_part, chest_geom, vector3(0.0f, 0.9f, 0.0f)))
-                    {
-                        if (head_node.world_valid)
-                            set_node_from_part(neck_node, head_part, head_geom, vector3(0.0f, -0.8f, 0.0f));
-                    }
-
-                    BoneNode chest_node;
-                    if (!set_node_from_part(chest_node, chest_part, chest_geom, vector3(0.0f, 0.1f, 0.0f)) && hrp_geom.valid)
-                        set_node_from_part(chest_node, hrp_part, hrp_geom, vector3(0.0f, 0.1f, 0.0f));
-
-                    BoneNode pelvis_node;
-                    if (!set_node_from_part(pelvis_node, pelvis_part, pelvis_geom, vector3(0.0f, -0.2f, 0.0f)))
-                        pelvis_node = chest_node;
-
-                    if (!neck_node.world_valid && head_node.world_valid && chest_node.world_valid)
-                    {
-                        neck_node.world = chest_node.world + (head_node.world - chest_node.world) * 0.35f;
-                        neck_node.world_valid = true;
-                    }
-
-                    BoneNode collar_node;
-                    if (neck_node.world_valid)
-                    {
-                        collar_node = neck_node;
-                        collar_node.world.Y -= 0.08f;
-                        collar_node.world_valid = true;
-                    }
-                    else if (chest_node.world_valid)
-                    {
-                        collar_node = chest_node;
-                        collar_node.world_valid = true;
-                    }
-
-                    auto left_upper_arm = resolve_part(player, player.left_upper_arm, {"LeftUpperArm", "Left Arm"});
-                    auto right_upper_arm = resolve_part(player, player.right_upper_arm, {"RightUpperArm", "Right Arm"});
-                    auto left_lower_arm = resolve_part(player, player.left_lower_arm, {"LeftLowerArm", "Left Arm"});
-                    auto right_lower_arm = resolve_part(player, player.right_lower_arm, {"RightLowerArm", "Right Arm"});
-                    auto left_hand_part = resolve_part(player, player.left_hand, {"LeftHand", "Left Arm", "LeftLowerArm"});
-                    auto right_hand_part = resolve_part(player, player.right_hand, {"RightHand", "Right Arm", "RightLowerArm"});
-
-                    PartGeometry left_upper_arm_geom, right_upper_arm_geom, left_lower_arm_geom, right_lower_arm_geom, left_hand_geom, right_hand_geom;
-                    capture_geometry(left_upper_arm, left_upper_arm_geom);
-                    capture_geometry(right_upper_arm, right_upper_arm_geom);
-                    capture_geometry(left_lower_arm, left_lower_arm_geom);
-                    capture_geometry(right_lower_arm, right_lower_arm_geom);
-                    capture_geometry(left_hand_part, left_hand_geom);
-                    capture_geometry(right_hand_part, right_hand_geom);
-
-                    auto left_upper_leg = resolve_part(player, player.left_upper_leg, {"LeftUpperLeg", "Left Leg"});
-                    auto right_upper_leg = resolve_part(player, player.right_upper_leg, {"RightUpperLeg", "Right Leg"});
-                    auto left_lower_leg = resolve_part(player, player.left_lower_leg, {"LeftLowerLeg", "Left Leg"});
-                    auto right_lower_leg = resolve_part(player, player.right_lower_leg, {"RightLowerLeg", "Right Leg"});
-                    auto left_foot_part = resolve_part(player, player.left_foot, {"LeftFoot", "Left Leg", "LeftLowerLeg"});
-                    auto right_foot_part = resolve_part(player, player.right_foot, {"RightFoot", "Right Leg", "RightLowerLeg"});
-
-                    PartGeometry left_upper_leg_geom, right_upper_leg_geom, left_lower_leg_geom, right_lower_leg_geom, left_foot_geom, right_foot_geom;
-                    capture_geometry(left_upper_leg, left_upper_leg_geom);
-                    capture_geometry(right_upper_leg, right_upper_leg_geom);
-                    capture_geometry(left_lower_leg, left_lower_leg_geom);
-                    capture_geometry(right_lower_leg, right_lower_leg_geom);
-                    capture_geometry(left_foot_part, left_foot_geom);
-                    capture_geometry(right_foot_part, right_foot_geom);
-
-                    BoneNode left_shoulder;
-                    BoneNode right_shoulder;
-                    if (!set_node_from_part(left_shoulder, left_upper_arm, left_upper_arm_geom, vector3(0.0f, 1.0f, 0.0f)))
-                        set_node_from_part(left_shoulder, chest_part, chest_geom, vector3(0.85f, 0.4f, 0.0f));
-                    if (!set_node_from_part(right_shoulder, right_upper_arm, right_upper_arm_geom, vector3(0.0f, 1.0f, 0.0f)))
-                        set_node_from_part(right_shoulder, chest_part, chest_geom, vector3(-0.85f, 0.4f, 0.0f));
-
-                    auto align_shoulder_height = [&](BoneNode &shoulder, float fallback_sign) {
-                        if (!shoulder.world_valid && collar_node.world_valid)
-                        {
-                            shoulder.world = collar_node.world + vector3(fallback_sign * 0.42f, 0.0f, 0.0f);
-                            shoulder.world_valid = true;
-                        }
-                        if (shoulder.world_valid && collar_node.world_valid)
-                            shoulder.world.Y = collar_node.world.Y;
-                        else if (shoulder.world_valid && neck_node.world_valid)
-                            shoulder.world.Y = neck_node.world.Y;
-                    };
-
-                    align_shoulder_height(left_shoulder, 1.0f);
-                    align_shoulder_height(right_shoulder, -1.0f);
-
-                    BoneNode left_elbow;
-                    BoneNode right_elbow;
-                    BoneNode left_hand;
-                    BoneNode right_hand;
-
-                    auto build_arm_chain = [&](const engine::Instance &upper_inst, const PartGeometry &upper_geom,
-                                               const engine::Instance &lower_inst, const PartGeometry &lower_geom,
-                                               const engine::Instance &hand_inst, const PartGeometry &hand_geom,
-                                               BoneNode &shoulder, BoneNode &elbow, BoneNode &hand) {
-                        vector3 joint_point;
-                        if (!elbow.world_valid && sample_from_geometry(upper_geom, vector3(0.0f, -1.0f, 0.0f), joint_point))
-                        {
-                            elbow.world = joint_point;
-                            elbow.world_valid = true;
-                        }
-                        if (sample_from_geometry(lower_geom, vector3(0.0f, 1.0f, 0.0f), joint_point))
-                        {
-                            if (elbow.world_valid)
-                                elbow.world = (elbow.world + joint_point) * 0.5f;
+                            if (build_skeleton_world(player, bones))
+                            {
+                                cache_bone_world(bones, cached.skeleton);
+                                cached.skeleton.world_valid = true;
+                                cached.skeleton.last_update = now;
+                                have_skeleton = true;
+                            }
                             else
                             {
-                                elbow.world = joint_point;
-                                elbow.world_valid = true;
+                                cached.skeleton.world_valid = false;
                             }
                         }
-                        if (sample_from_geometry(lower_geom, vector3(0.0f, -1.0f, 0.0f), joint_point))
+                        else
                         {
-                            hand.world = joint_point;
-                            hand.world_valid = true;
+                            restore_bone_world(cached.skeleton, bones);
+                            have_skeleton = true;
                         }
-                        if (!hand.world_valid)
-                            set_node_from_part(hand, hand_inst, hand_geom, vector3(0.0f, -0.2f, 0.0f));
-                        if (!hand.world_valid && elbow.world_valid && shoulder.world_valid)
+
+                        if (have_skeleton)
                         {
-                            vector3 dir = elbow.world - shoulder.world;
-                            if (dir.magnitude() > 0.01f)
-                            {
-                                hand.world = elbow.world + dir;
-                                hand.world_valid = true;
-                            }
+                            auto project_point = [&](BoneNode &node) {
+                                if (!node.world_valid)
+                                    return;
+                                vector2 screen = world_to_screen(node.world, view_matrix, screen_size);
+                                if (screen.X == -1 || screen.Y == -1)
+                                    return;
+                                node.screen = ImVec2(screen.X + client_offset_x, screen.Y + client_offset_y);
+                                node.screen_valid = true;
+                            };
+
+                            for (auto &node : bones)
+                                project_point(node);
+
+                            auto &head_node = get_bone(bones, SkeletonPoint::Head);
+                            auto &neck_node = get_bone(bones, SkeletonPoint::Neck);
+                            auto &collar_node = get_bone(bones, SkeletonPoint::Collar);
+                            auto &chest_node = get_bone(bones, SkeletonPoint::Chest);
+                            auto &pelvis_node = get_bone(bones, SkeletonPoint::Pelvis);
+                            auto &left_shoulder = get_bone(bones, SkeletonPoint::LeftShoulder);
+                            auto &left_elbow = get_bone(bones, SkeletonPoint::LeftElbow);
+                            auto &left_hand = get_bone(bones, SkeletonPoint::LeftHand);
+                            auto &right_shoulder = get_bone(bones, SkeletonPoint::RightShoulder);
+                            auto &right_elbow = get_bone(bones, SkeletonPoint::RightElbow);
+                            auto &right_hand = get_bone(bones, SkeletonPoint::RightHand);
+                            auto &left_hip = get_bone(bones, SkeletonPoint::LeftHip);
+                            auto &left_knee = get_bone(bones, SkeletonPoint::LeftKnee);
+                            auto &left_foot = get_bone(bones, SkeletonPoint::LeftFoot);
+                            auto &right_hip = get_bone(bones, SkeletonPoint::RightHip);
+                            auto &right_knee = get_bone(bones, SkeletonPoint::RightKnee);
+                            auto &right_foot = get_bone(bones, SkeletonPoint::RightFoot);
+
+                            bool skeleton_drawn = false;
+                            auto draw_bone = [&](const BoneNode &a, const BoneNode &b) {
+                                if (!a.screen_valid || !b.screen_valid)
+                                    return;
+                                float thickness = std::clamp(raw_height * 0.0022f + 0.8f, 0.75f, 2.8f);
+                                draw_list->AddLine(a.screen, b.screen, scale_color(state_color), thickness);
+                                skeleton_drawn = true;
+                            };
+
+                            draw_bone(head_node, neck_node);
+                            draw_bone(neck_node, collar_node);
+                            draw_bone(collar_node, chest_node);
+                            draw_bone(chest_node, pelvis_node);
+
+                            draw_bone(collar_node, left_shoulder);
+                            draw_bone(left_shoulder, left_elbow);
+                            draw_bone(left_elbow, left_hand);
+
+                            draw_bone(collar_node, right_shoulder);
+                            draw_bone(right_shoulder, right_elbow);
+                            draw_bone(right_elbow, right_hand);
+
+                            draw_bone(left_shoulder, right_shoulder);
+
+                            draw_bone(pelvis_node, left_hip);
+                            draw_bone(left_hip, left_knee);
+                            draw_bone(left_knee, left_foot);
+
+                            draw_bone(pelvis_node, right_hip);
+                            draw_bone(right_hip, right_knee);
+                            draw_bone(right_knee, right_foot);
+
+                            if (skeleton_drawn)
+                                rendered_this_player = true;
                         }
-                    };
-
-                    build_arm_chain(left_upper_arm, left_upper_arm_geom, left_lower_arm, left_lower_arm_geom, left_hand_part, left_hand_geom, left_shoulder, left_elbow, left_hand);
-                    build_arm_chain(right_upper_arm, right_upper_arm_geom, right_lower_arm, right_lower_arm_geom, right_hand_part, right_hand_geom, right_shoulder, right_elbow, right_hand);
-
-                    BoneNode left_hip;
-                    BoneNode right_hip;
-                    const engine::Instance &hip_anchor_inst = pelvis_part.is_valid() ? pelvis_part : chest_part;
-                    const PartGeometry &hip_anchor_geom = pelvis_geom.valid ? pelvis_geom : chest_geom;
-                    if (!set_node_from_part(left_hip, left_upper_leg, left_upper_leg_geom, vector3(0.0f, 1.0f, 0.0f)))
-                        set_node_from_part(left_hip, hip_anchor_inst, hip_anchor_geom, vector3(0.55f, -0.4f, 0.0f));
-                    if (!set_node_from_part(right_hip, right_upper_leg, right_upper_leg_geom, vector3(0.0f, 1.0f, 0.0f)))
-                        set_node_from_part(right_hip, hip_anchor_inst, hip_anchor_geom, vector3(-0.55f, -0.4f, 0.0f));
-
-                    BoneNode left_knee;
-                    BoneNode right_knee;
-                    BoneNode left_foot;
-                    BoneNode right_foot;
-
-                    auto build_leg_chain = [&](const engine::Instance &upper_inst, const PartGeometry &upper_geom,
-                                               const engine::Instance &lower_inst, const PartGeometry &lower_geom,
-                                               const engine::Instance &foot_inst, const PartGeometry &foot_geom,
-                                               BoneNode &hip, BoneNode &knee, BoneNode &foot) {
-                        vector3 joint_point;
-                        if (!knee.world_valid && sample_from_geometry(upper_geom, vector3(0.0f, -1.0f, 0.0f), joint_point))
-                        {
-                            knee.world = joint_point;
-                            knee.world_valid = true;
-                        }
-                        if (sample_from_geometry(lower_geom, vector3(0.0f, 1.0f, 0.0f), joint_point))
-                        {
-                            if (knee.world_valid)
-                                knee.world = (knee.world + joint_point) * 0.5f;
-                            else
-                            {
-                                knee.world = joint_point;
-                                knee.world_valid = true;
-                            }
-                        }
-                        if (sample_from_geometry(lower_geom, vector3(0.0f, -1.0f, 0.0f), joint_point))
-                        {
-                            foot.world = joint_point;
-                            foot.world_valid = true;
-                        }
-                        if (!foot.world_valid)
-                            set_node_from_part(foot, foot_inst, foot_geom, vector3(0.0f, -0.8f, 0.0f));
-                        if (!foot.world_valid && knee.world_valid && hip.world_valid)
-                        {
-                            vector3 dir = knee.world - hip.world;
-                            if (dir.magnitude() > 0.01f)
-                            {
-                                foot.world = knee.world + dir;
-                                foot.world_valid = true;
-                            }
-                        }
-                    };
-
-                    build_leg_chain(left_upper_leg, left_upper_leg_geom, left_lower_leg, left_lower_leg_geom, left_foot_part, left_foot_geom, left_hip, left_knee, left_foot);
-                    build_leg_chain(right_upper_leg, right_upper_leg_geom, right_lower_leg, right_lower_leg_geom, right_foot_part, right_foot_geom, right_hip, right_knee, right_foot);
-
-                    project_point(head_node);
-                    project_point(neck_node);
-                    project_point(collar_node);
-                    project_point(chest_node);
-                    project_point(pelvis_node);
-                    project_point(left_shoulder);
-                    project_point(right_shoulder);
-                    project_point(left_elbow);
-                    project_point(right_elbow);
-                    project_point(left_hand);
-                    project_point(right_hand);
-                    project_point(left_hip);
-                    project_point(right_hip);
-                    project_point(left_knee);
-                    project_point(right_knee);
-                    project_point(left_foot);
-                    project_point(right_foot);
-
-                    bool skeleton_drawn = false;
-                    auto draw_bone = [&](const BoneNode &a, const BoneNode &b) {
-                        if (!a.screen_valid || !b.screen_valid)
-                            return;
-                        float thickness = std::clamp(raw_height * 0.0022f + 0.8f, 0.75f, 2.8f);
-                        draw_list->AddLine(a.screen, b.screen, scale_color(state_color), thickness);
-                        skeleton_drawn = true;
-                    };
-
-                    draw_bone(head_node, neck_node);
-                    draw_bone(neck_node, collar_node);
-                    draw_bone(collar_node, chest_node);
-                    draw_bone(chest_node, pelvis_node);
-
-                    draw_bone(collar_node, left_shoulder);
-                    draw_bone(left_shoulder, left_elbow);
-                    draw_bone(left_elbow, left_hand);
-
-                    draw_bone(collar_node, right_shoulder);
-                    draw_bone(right_shoulder, right_elbow);
-                    draw_bone(right_elbow, right_hand);
-
-                    draw_bone(left_shoulder, right_shoulder);
-
-                    draw_bone(pelvis_node, left_hip);
-                    draw_bone(left_hip, left_knee);
-                    draw_bone(left_knee, left_foot);
-
-                    draw_bone(pelvis_node, right_hip);
-                    draw_bone(right_hip, right_knee);
-                    draw_bone(right_knee, right_foot);
-
-                    if (skeleton_drawn)
-                        rendered_this_player = true;
+                    }
                 }
 
                 if (draw_head_circle && cached.head_valid)
