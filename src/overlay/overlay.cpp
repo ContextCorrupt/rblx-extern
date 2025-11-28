@@ -25,6 +25,7 @@ extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd, UINT msg
 #include <sstream>
 #include <dwmapi.h>
 #include <limits>
+#include <mutex>
 #include "../util/engine/visualengine/visualengine.hpp"
 #include "../util/engine/datamodel/datamodel.hpp"
 #include "../util/engine/instance/instance.hpp"
@@ -1074,6 +1075,76 @@ namespace cradle
                                     }
                                 }
 
+                                void RenderLoadingOverlay(Overlay::LoadingStage stage, const std::string &message)
+                                {
+                                    ImGuiViewport *viewport = ImGui::GetMainViewport();
+                                    if (!viewport)
+                                        return;
+
+                                    ImDrawList *loading_draw_list = ImGui::GetForegroundDrawList();
+                                    if (!loading_draw_list)
+                                        return;
+
+                                    ImVec2 screen_min = viewport->Pos;
+                                    ImVec2 screen_max = viewport->Pos + viewport->Size;
+                                    loading_draw_list->AddRectFilled(screen_min, screen_max, IM_COL32(5, 5, 5, 195));
+
+                                    ImVec2 center((screen_min.x + screen_max.x) * 0.5f, (screen_min.y + screen_max.y) * 0.5f);
+                                    ImVec2 box_size(360.0f, 160.0f);
+                                    ImVec2 box_min(center.x - box_size.x * 0.5f, center.y - box_size.y * 0.5f);
+                                    ImVec2 box_max(center.x + box_size.x * 0.5f, center.y + box_size.y * 0.5f);
+
+                                    loading_draw_list->AddRectFilled(box_min, box_max, IM_COL32(18, 18, 18, 240), 12.0f);
+                                    loading_draw_list->AddRect(box_min, box_max, IM_COL32(255, 255, 255, 40), 12.0f);
+
+                                    const char *stage_text = "loading";
+                                    switch (stage)
+                                    {
+                                    case Overlay::LoadingStage::WaitingForRoblox:
+                                        stage_text = "waiting for roblox";
+                                        break;
+                                    case Overlay::LoadingStage::Attaching:
+                                        stage_text = "roblox detected";
+                                        break;
+                                    case Overlay::LoadingStage::Initializing:
+                                        stage_text = "loading cheat";
+                                        break;
+                                    case Overlay::LoadingStage::Ready:
+                                        stage_text = "ready";
+                                        break;
+                                    case Overlay::LoadingStage::Failed:
+                                        stage_text = "shutting down";
+                                        break;
+                                    }
+
+                                    std::string details = message;
+                                    if (details.empty())
+                                        details = "preparing environment...";
+                                    ImU32 stage_color = stage == Overlay::LoadingStage::Failed ? IM_COL32(255, 120, 120, 255) : IM_COL32(255, 255, 255, 255);
+                                    ImVec2 stage_pos(box_min.x + 32.0f, box_min.y + 32.0f);
+                                    loading_draw_list->AddText(stage_pos, stage_color, stage_text);
+                                    ImVec2 detail_pos(stage_pos.x, stage_pos.y + 28.0f);
+                                    loading_draw_list->AddText(detail_pos, IM_COL32(185, 185, 185, 255), details.c_str());
+                                    ImVec2 tip_pos(stage_pos.x, detail_pos.y + 26.0f);
+                                    loading_draw_list->AddText(tip_pos, IM_COL32(130, 130, 130, 255), "Overlay activates automatically when ready.");
+
+                                    float spinner_radius = 18.0f;
+                                    ImVec2 spinner_center(box_max.x - 48.0f, box_min.y + 42.0f);
+                                    float time = static_cast<float>(ImGui::GetTime());
+                                    float start_angle = time * 4.3f;
+                                    float sweep = IM_PI * 1.45f;
+                                    int segments = 64;
+                                    loading_draw_list->PathClear();
+                                    for (int i = 0; i <= segments; ++i)
+                                    {
+                                        float angle = start_angle + sweep * (static_cast<float>(i) / static_cast<float>(segments));
+                                        loading_draw_list->PathLineTo(ImVec2(spinner_center.x + std::cos(angle) * spinner_radius,
+                                                                     spinner_center.y + std::sin(angle) * spinner_radius));
+                                    }
+                                    ImU32 spinner_color = stage == Overlay::LoadingStage::Failed ? IM_COL32(255, 120, 120, 255) : IM_COL32(120, 190, 255, 255);
+                                    loading_draw_list->PathStroke(spinner_color, false, 4.0f);
+                                }
+
                                 void RenderProfilingPanel(evo::child_t *child, cradle::modules::Module *module)
                                 {
                                     child->make_text("Profiling overlays");
@@ -1430,6 +1501,42 @@ namespace cradle
                             UINT Overlay::resize_height = 0;
                             Overlay *Overlay::instance = nullptr;
                             bool Overlay::menu_visible = false;
+                            std::atomic<bool> Overlay::runtime_ready{false};
+                            std::atomic<Overlay::LoadingStage> Overlay::loading_stage{Overlay::LoadingStage::WaitingForRoblox};
+                            std::mutex Overlay::loading_message_mutex;
+                            std::string Overlay::loading_message = "Waiting for Roblox...";
+
+                            void Overlay::set_loading_stage(LoadingStage stage, const std::string &message)
+                            {
+                                loading_stage.store(stage, std::memory_order_relaxed);
+                                {
+                                    std::lock_guard<std::mutex> lock(loading_message_mutex);
+                                    loading_message = message;
+                                }
+                            }
+
+                            Overlay::LoadingStage Overlay::get_loading_stage()
+                            {
+                                return loading_stage.load(std::memory_order_relaxed);
+                            }
+
+                            std::string Overlay::get_loading_message()
+                            {
+                                std::lock_guard<std::mutex> lock(loading_message_mutex);
+                                return loading_message;
+                            }
+
+                            void Overlay::set_runtime_ready(bool ready)
+                            {
+                                runtime_ready.store(ready, std::memory_order_release);
+                                if (ready && loading_stage.load(std::memory_order_relaxed) != LoadingStage::Ready)
+                                    loading_stage.store(LoadingStage::Ready, std::memory_order_relaxed);
+                            }
+
+                            bool Overlay::is_runtime_ready()
+                            {
+                                return runtime_ready.load(std::memory_order_acquire);
+                            }
 
                             bool Overlay::initialize()
                             {
@@ -1735,33 +1842,44 @@ namespace cradle
                                     key_state[key] = down;
                                 }
 
-                                cradle::engine::PlayerCache::update_cache();
-                                TickMovementOverrides();
-                                TickGravityOverride();
+                                bool runtime_ready_flag = Overlay::is_runtime_ready();
 
-                                static auto last_wall_cache_tick = std::chrono::steady_clock::time_point{};
-                                auto now = std::chrono::steady_clock::now();
-                                constexpr auto kWallCacheInterval = std::chrono::milliseconds(50);
-                                if (now - last_wall_cache_tick >= kWallCacheInterval)
+                                if (runtime_ready_flag)
                                 {
-                                    auto dm_instance = cradle::engine::DataModel::get_instance();
-                                    if (dm_instance.is_valid())
+                                    cradle::engine::PlayerCache::update_cache();
+                                    TickMovementOverrides();
+                                    TickGravityOverride();
+
+                                    static auto last_wall_cache_tick = std::chrono::steady_clock::time_point{};
+                                    auto now = std::chrono::steady_clock::now();
+                                    constexpr auto kWallCacheInterval = std::chrono::milliseconds(50);
+                                    if (now - last_wall_cache_tick >= kWallCacheInterval)
                                     {
-                                        cradle::engine::Wallcheck::update_world_cache(dm_instance);
-                                        last_wall_cache_tick = now;
+                                        auto dm_instance = cradle::engine::DataModel::get_instance();
+                                        if (dm_instance.is_valid())
+                                        {
+                                            cradle::engine::Wallcheck::update_world_cache(dm_instance);
+                                            last_wall_cache_tick = now;
+                                        }
                                     }
+                                    manager.update_all();
+                                    manager.render_all();
+
+                                    RenderCheatIndicator();
+
+                                    if (menu_visible)
+                                    {
+                                        RenderEvoMenuWindow(*this);
+                                    }
+
+                                    cradle::config::ConfigManager::tick(manager);
                                 }
-                                manager.update_all();
-                                manager.render_all();
-
-                                RenderCheatIndicator();
-
-                                if (menu_visible)
+                                else
                                 {
-                                    RenderEvoMenuWindow(*this);
+                                    auto stage = Overlay::get_loading_stage();
+                                    auto loading_text = Overlay::get_loading_message();
+                                    RenderLoadingOverlay(stage, loading_text);
                                 }
-
-                                cradle::config::ConfigManager::tick(manager);
 
                                 auto render_start = std::chrono::high_resolution_clock::now();
                                 ImGui::Render();

@@ -473,8 +473,17 @@ namespace cradle::engine
                     return true;
                 if (part.vol <= 0.0f || part.size.X <= 0.0f || part.size.Y <= 0.0f || part.size.Z <= 0.0f)
                     return true;
-                if (dist > 80.0f && part.vol < 175.0f)
+                if (dist > 80.0f)
+                {
+                    float volume_gate = 60.0f + std::min(dist, 240.0f) * 0.45f;
+                    float radius_gate = 1.75f + std::min(dist, 220.0f) * 0.004f;
+                    if (part.vol < volume_gate && part.bounding_radius < radius_gate)
+                        return true;
+                }
+                else if (dist > 45.0f && part.vol < 90.0f && part.bounding_radius < 1.35f)
+                {
                     return true;
+                }
 
                 float hit_distance = 0.0f;
                 if (check_ray_box(origin, dir, part, dist, &hit_distance))
@@ -627,8 +636,16 @@ namespace cradle::engine
 
         float dynamic_required = std::max(1.0f, std::ceil(std::max(checked, 1) * base_ratio));
         dynamic_required = std::min(dynamic_required, max_visibility_goal);
+        if (target_distance > 80.0f)
+            dynamic_required = std::max(dynamic_required, 1.25f);
+        if (target_distance > 120.0f)
+            dynamic_required = std::max(dynamic_required, 1.5f);
 
         float central_gate = std::max(0.35f * dynamic_required, 0.55f);
+        if (target_distance > 80.0f)
+            central_gate = std::max(central_gate, 1.15f);
+        if (target_distance > 120.0f)
+            central_gate = std::max(central_gate, 1.4f);
         central_gate = std::min(central_gate, dynamic_required);
         auto recompute_central_satisfied = [&]() -> bool {
             return central_override || central_score >= central_gate;
@@ -651,6 +668,8 @@ namespace cradle::engine
         bool lateral_probe = false;
 
         float fallback_gate = std::max(0.35f * dynamic_required, 0.6f);
+        if (target_distance > 80.0f)
+            fallback_gate = std::max(fallback_gate, central_gate);
         bool fallback_allowed = ((visible_score >= fallback_gate) && central_satisfied) || head_override || direct_head_success;
 
         if (!result && fallback_allowed)

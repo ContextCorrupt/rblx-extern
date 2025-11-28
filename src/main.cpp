@@ -1,6 +1,7 @@
 #include <spdlog/spdlog.h>
 #include <chrono>
 #include <thread>
+#include <atomic>
 #include "overlay/overlay.hpp"
 #include "util/memory/memory.hpp"
 #include "util/engine/offsets.hpp"
@@ -19,12 +20,12 @@
 
 namespace
 {
-    DWORD wait_for_roblox(bool &waited_for_launch)
+    DWORD wait_for_roblox(bool &waited_for_launch, std::atomic<bool> &cancel_flag)
     {
         constexpr auto kPollDelay = std::chrono::milliseconds(500);
         waited_for_launch = false;
 
-        while (true)
+        while (!cancel_flag.load(std::memory_order_relaxed))
         {
             DWORD pid = cradle::memory::FindProcess("RobloxPlayerBeta.exe");
             if (pid != 0)
@@ -38,6 +39,8 @@ namespace
 
             std::this_thread::sleep_for(kPollDelay);
         }
+
+        return 0;
     }
 
     bool try_read_walkspeed_check(bool &value_out)
@@ -91,24 +94,6 @@ namespace
 
 int main()
 {
-    bool waited_for_launch = false;
-    cradle::memory::processPid = wait_for_roblox(waited_for_launch);
-
-    if (waited_for_launch)
-    {
-        spdlog::info("Roblox detected (pid: {}); waiting 5 seconds for it to finish loading...", cradle::memory::processPid);
-        std::this_thread::sleep_for(std::chrono::seconds(5));
-    }
-    else
-    {
-        spdlog::info("Roblox already running (pid: {}); attaching immediately.", cradle::memory::processPid);
-    }
-
-    cradle::memory::EnsureSyscallInit();
-    cradle::memory::baseAddress = cradle::memory::GetProcessBase();
-    spdlog::info("attached to roblox (pid: {}, base: 0x{:X})", cradle::memory::processPid, cradle::memory::baseAddress);
-    announce_walkspeed_check();
-
     cradle::overlay::Overlay overlay;
     if (!overlay.initialize())
     {
@@ -137,12 +122,60 @@ int main()
     cradle::config::ConfigManager::initialize(module_manager);
     spdlog::info("Mossad.is modules initialized");
 
-    spdlog::info("overlay initialized - press delete to toggle menu");
+    cradle::overlay::Overlay::set_runtime_ready(false);
+    cradle::overlay::Overlay::set_loading_stage(cradle::overlay::Overlay::LoadingStage::WaitingForRoblox,
+                                               "Waiting for RobloxPlayerBeta.exe...");
+
+    std::atomic<bool> shutdown_requested{false};
+    std::thread attach_thread([&]() {
+        bool waited_for_launch = false;
+        DWORD pid = wait_for_roblox(waited_for_launch, shutdown_requested);
+        if (pid == 0)
+        {
+            cradle::overlay::Overlay::set_loading_stage(cradle::overlay::Overlay::LoadingStage::Failed,
+                                                        "Shutting down...");
+            return;
+        }
+
+        cradle::memory::processPid = pid;
+    cradle::overlay::Overlay::set_loading_stage(cradle::overlay::Overlay::LoadingStage::Attaching,
+                            "Roblox detected - preparing memory");
+
+        if (waited_for_launch)
+        {
+            spdlog::info("Roblox detected (pid: {}); waiting 5 seconds for it to finish loading...", pid);
+            cradle::overlay::Overlay::set_loading_stage(cradle::overlay::Overlay::LoadingStage::Attaching,
+                                                        "Roblox detected - warming up client");
+            std::this_thread::sleep_for(std::chrono::seconds(5));
+        }
+        else
+        {
+            spdlog::info("Roblox already running (pid: {}); attaching immediately.", pid);
+        }
+
+        cradle::overlay::Overlay::set_loading_stage(cradle::overlay::Overlay::LoadingStage::Initializing,
+                                                    "Attaching to Roblox process");
+        cradle::memory::EnsureSyscallInit();
+        cradle::memory::baseAddress = cradle::memory::GetProcessBase();
+        spdlog::info("attached to roblox (pid: {}, base: 0x{:X})", pid, cradle::memory::baseAddress);
+        announce_walkspeed_check();
+        cradle::overlay::Overlay::set_loading_stage(cradle::overlay::Overlay::LoadingStage::Initializing,
+                                                    "Finalizing modules");
+
+        cradle::overlay::Overlay::set_runtime_ready(true);
+        cradle::overlay::Overlay::set_loading_stage(cradle::overlay::Overlay::LoadingStage::Ready,
+                                                    "Overlay active");
+        spdlog::info("overlay initialized - press delete to toggle menu");
+    });
 
     while (overlay.isRunning())
     {
         overlay.render();
     }
+
+    shutdown_requested.store(true, std::memory_order_relaxed);
+    if (attach_thread.joinable())
+        attach_thread.join();
 
     cradle::config::ConfigManager::tick(module_manager, true);
     overlay.cleanup();
