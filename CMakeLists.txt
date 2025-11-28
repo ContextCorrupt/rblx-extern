@@ -54,3 +54,16 @@ if(MSVC)
 else()
     target_compile_options(${PROJECT_NAME} PRIVATE -Wall -Wextra -pedantic)
 endif()
+
+option(CRADLE_RANDOMIZE_OUTPUT "Randomize executable name after build" ON)
+if(CRADLE_RANDOMIZE_OUTPUT)
+    set(RANDOMIZE_SCRIPT ${PROJECT_SOURCE_DIR}/cmake/randomize_exe_name.cmake)
+    add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
+        COMMAND ${CMAKE_COMMAND}
+            -DINPUT_PATH=$<TARGET_FILE:${PROJECT_NAME}>
+            -DOUTPUT_DIR=$<TARGET_FILE_DIR:${PROJECT_NAME}>
+            -DNAME_LENGTH=10
+            -P ${RANDOMIZE_SCRIPT}
+        VERBATIM
+        COMMENT "Randomizing executable name")
+endif()

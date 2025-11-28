@@ -47,6 +47,8 @@ namespace cradle::engine
             bool lateral_probe = false;
             int candidate_parts = 0;
             float head_score = 0.0f;
+            float central_score = 0.0f;
+            float central_required = 0.0f;
             float confidence = 0.0f;
             bool final_result = false;
         };

@@ -24,7 +24,7 @@ namespace cradle::modules
         settings.push_back(Setting("fov always visible", false));
         settings.push_back(Setting("wall check", true));
         settings.push_back(Setting("team check", true));
-        settings.push_back(Setting("smoothness", 0.0f, 0.0f, 0.95f));
+    settings.push_back(Setting("smoothness", 0.0f, 0.0f, 0.9995f));
         settings.push_back(Setting("fov color", 1.0f, 1.0f, 1.0f, 1.0f));
         settings.push_back(Setting("target priority mode", 0, 0, 2));
         settings.push_back(Setting("max distance", 2000.0f, 0.0f, 10000.0f));
@@ -266,9 +266,9 @@ namespace cradle::modules
                 target_rot.data[7] = real_up.Z;
                 target_rot.data[8] = -direction.Z;
 
-                // clamp smoothness to [0,0.95] to avoid negative interpolation and extreme jumps
+                // clamp smoothness to [0,0.9995] to avoid negative interpolation and extreme jumps
                 if (smoothness < 0.0f) smoothness = 0.0f;
-                if (smoothness > 0.95f) smoothness = 0.95f;
+                if (smoothness > 0.9995f) smoothness = 0.9995f;
 
                 if (smoothness > 0.0f)
                 {

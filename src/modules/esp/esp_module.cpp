@@ -1396,13 +1396,15 @@ void ESPModule::on_render()
                     {
                         char debug_text[192];
                         std::snprintf(debug_text, sizeof(debug_text),
-                                      "rays %d/%d · cand %d · score %.1f/%.1f (head %.1f) · conf %.0f%% · dh %.1f · range %.0f · head %s · fallback %s · lat %s · vis %s",
+                                      "rays %d/%d · cand %d · score %.1f/%.1f (head %.1f · core %.1f/%.1f) · conf %.0f%% · dh %.1f · range %.0f · head %s · fallback %s · lat %s · vis %s",
                                       debug.rays_checked,
                                       debug.rays_enqueued,
                                       debug.candidate_parts,
                                       debug.visible_score,
                                       debug.required_score,
                                       debug.head_score,
+                                      debug.central_score,
+                                      debug.central_required,
                                       debug.confidence * 100.0f,
                                       debug.height_delta,
                                       debug.target_distance,

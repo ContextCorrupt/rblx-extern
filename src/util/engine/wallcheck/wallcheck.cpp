@@ -364,8 +364,10 @@ namespace cradle::engine
 
     float visible_score = 0.0f;
     float head_score = 0.0f;
+    float central_score = 0.0f;
     std::uint8_t region_hits = 0;
     bool head_override = false;
+    bool central_override = false;
     bool lateral_success = false;
     int checked = 0;
     int total_considered = std::min<int>(72, static_cast<int>(rays.size()));
@@ -491,10 +493,17 @@ namespace cradle::engine
                     if (near_origin_hit && part.vol < 80.0f)
                         return true;
                     float part_dist = (part.pos - origin).magnitude();
+                    float occlusion_gap = dist - hit_distance;
                     if (std::fabs(part_dist - dist) < 1.5f)
-                        return true;
-                    if (dist - hit_distance < 1.2f)
-                        return true;
+                    {
+                        if (part.bounding_radius < 2.25f && part.vol < 120.0f)
+                            return true;
+                    }
+                    if (occlusion_gap < 1.2f)
+                    {
+                        if (part.bounding_radius < 2.5f && part.vol < 150.0f)
+                            return true;
+                    }
                     return false;
                 }
                 return true;
@@ -521,6 +530,7 @@ namespace cradle::engine
 
         auto register_head_success = [&](float bonus_score, bool mark_lateral) {
             head_override = true;
+            central_override = true;
             region_hits |= kRegionHead;
             head_score += bonus_score;
             visible_score = std::max(visible_score, std::max(required_visible, 1.0f));
@@ -588,6 +598,8 @@ namespace cradle::engine
                 if (clear)
                 {
                     visible_score += ray.weight;
+                    if (!ray.lateral)
+                        central_score += ray.weight;
                     region_hits |= ray.mask;
                     if (ray.mask & kRegionHead)
                     {
@@ -616,17 +628,30 @@ namespace cradle::engine
         float dynamic_required = std::max(1.0f, std::ceil(std::max(checked, 1) * base_ratio));
         dynamic_required = std::min(dynamic_required, max_visibility_goal);
 
-        bool body_region_visible = region_hits & (kRegionHead | kRegionTorso | kRegionPelvis);
+        float central_gate = std::max(0.35f * dynamic_required, 0.55f);
+        central_gate = std::min(central_gate, dynamic_required);
+        auto recompute_central_satisfied = [&]() -> bool {
+            return central_override || central_score >= central_gate;
+        };
+        bool central_satisfied = recompute_central_satisfied();
+
+        bool body_region_visible = (region_hits & (kRegionHead | kRegionTorso | kRegionPelvis)) != 0;
         if (head_override)
             body_region_visible = true;
+        if (body_region_visible && !central_satisfied && !head_override)
+            body_region_visible = false;
 
-        bool result = (visible_score >= dynamic_required) || body_region_visible;
+        bool base_visible = visible_score >= dynamic_required;
+        if (base_visible && !central_satisfied)
+            base_visible = false;
+
+        bool result = base_visible || body_region_visible;
         float confidence = (dynamic_required > 0.0f) ? std::clamp(visible_score / dynamic_required, 0.0f, 2.5f) : 0.0f;
         bool fallback_used = false;
         bool lateral_probe = false;
 
         float fallback_gate = std::max(0.35f * dynamic_required, 0.6f);
-        bool fallback_allowed = (visible_score >= fallback_gate) || head_override || direct_head_success;
+        bool fallback_allowed = ((visible_score >= fallback_gate) && central_satisfied) || head_override || direct_head_success;
 
         if (!result && fallback_allowed)
         {
@@ -634,6 +659,8 @@ namespace cradle::engine
             {
                 result = true;
                 fallback_used = true;
+                central_override = true;
+                central_satisfied = true;
             }
         }
 
@@ -652,7 +679,7 @@ namespace cradle::engine
             }
         }
 
-        bool final_result = result;
+        bool final_result = result && (central_satisfied || head_override || direct_head_success);
         if (player_addr != 0)
         {
             auto now = std::chrono::steady_clock::now();
@@ -663,7 +690,7 @@ namespace cradle::engine
                 auto age = std::chrono::duration_cast<std::chrono::milliseconds>(now - existing->second.second).count();
                 constexpr int kVisibleHoldMs = 150;
                 float cache_gate = std::max(0.25f * dynamic_required, 0.45f);
-                bool allow_cache_hold = (visible_score >= cache_gate) || head_override || direct_head_success;
+                bool allow_cache_hold = ((visible_score >= cache_gate) && central_satisfied) || head_override || direct_head_success;
                 if (allow_cache_hold && age < kVisibleHoldMs)
                     final_result = true;
             }
@@ -695,6 +722,8 @@ namespace cradle::engine
             snapshot.fallback_used = fallback_used;
             snapshot.lateral_probe = lateral_probe || lateral_success;
             snapshot.candidate_parts = candidate_reference;
+            snapshot.central_score = central_score;
+            snapshot.central_required = central_gate;
             snapshot.confidence = confidence;
             snapshot.final_result = final_result;
             std::lock_guard<std::mutex> dlock(debug_snapshots_mtx);
@@ -765,10 +794,17 @@ namespace cradle::engine
                 if (part.vol < 15.0f)
                     continue;
                 float part_dist = (part.pos - origin).magnitude();
+                float occlusion_gap = dist - hit_distance;
                 if (std::fabs(part_dist - dist) < 1.5f)
-                    continue;
-                if (dist - hit_distance < 1.2f)
-                    continue;
+                {
+                    if (part.bounding_radius < 2.25f && part.vol < 120.0f)
+                        continue;
+                }
+                if (occlusion_gap < 1.2f)
+                {
+                    if (part.bounding_radius < 2.5f && part.vol < 150.0f)
+                        continue;
+                }
                 return false;
             }
         }
