@@ -67,11 +67,19 @@ namespace cradle
                 const char *label;
             };
 
+            enum class MemoryPanelSection
+            {
+                None = -1,
+                Walkspeed = 0,
+                JumpHeight,
+                Gravity
+            };
+
             struct ModuleListEntry
             {
                 std::string label;
                 cradle::modules::Module *module;
-                bool is_memory;
+                MemoryPanelSection memory_section = MemoryPanelSection::None;
             };
 
             const std::array<TabInfo, 4> kTabs = {
@@ -90,6 +98,7 @@ namespace cradle
             int g_active_tab = 0;
             cradle::modules::Module *g_selected_module = nullptr;
             bool g_memory_view_active = false;
+            MemoryPanelSection g_memory_view_section = MemoryPanelSection::None;
 
             struct CheatIndicatorEntry
             {
@@ -108,24 +117,56 @@ namespace cradle
             {
                 float custom_walkspeed = 16.0f;
                 float custom_jumpheight = 7.5f;
-                bool lock_stats = false;
-                float last_apply_time = 0.0f;
-                float last_apply_walk = 16.0f;
-                float last_apply_jump = 7.5f;
-                bool last_apply_success = false;
-                double last_enforce_time = 0.0;
-                bool defaults_initialized = false;
+
                 float default_walkspeed = 16.0f;
                 float default_jumpheight = 7.5f;
-                bool enforce_after_apply = false;
+
+                bool defaults_initialized = false;
                 bool humanoid_ready = false;
                 bool capture_next_defaults = false;
+
+                bool lock_walkspeed = false;
+                bool lock_jumpheight = false;
+
+                bool enforce_walk_after_apply = false;
+                bool enforce_jump_after_apply = false;
+
+                double last_walk_enforce_time = 0.0;
+                double last_jump_enforce_time = 0.0;
+
+                bool last_walk_apply_success = false;
+                bool last_jump_apply_success = false;
+
+                float last_walk_apply_value = 16.0f;
+                float last_jump_apply_value = 7.5f;
+
+                float last_walk_apply_time = 0.0f;
+                float last_jump_apply_time = 0.0f;
             };
 
             MovementOverrideState g_movement_override_state;
 
             constexpr float kMovementTolerance = 0.05f;
             constexpr double kMovementEnforceInterval = 0.05;
+
+            constexpr double kGravityEnforceInterval = 0.05;
+            constexpr float kDefaultGravity = 196.2f;
+
+            struct GravityOverrideState
+            {
+                float custom_gravity = kDefaultGravity;
+                float default_gravity = kDefaultGravity;
+                bool defaults_initialized = false;
+                bool lock_gravity = false;
+                bool workspace_ready = false;
+                bool last_apply_success = false;
+                float last_apply_value = kDefaultGravity;
+                float last_apply_time = 0.0f;
+                bool enforce_after_apply = false;
+                double last_enforce_time = 0.0;
+            };
+
+            GravityOverrideState g_gravity_override_state;
 
             static bool nearly_equal(float a, float b, float eps)
             {
@@ -134,8 +175,6 @@ namespace cradle
 
             void EnsureMovementDefaults(MovementOverrideState &state, const cradle::engine::Player &local_player)
             {
-                if (state.defaults_initialized)
-                    return;
                 if (!local_player.humanoid.is_valid())
                     return;
 
@@ -143,60 +182,78 @@ namespace cradle
                 float current_walk = cradle::memory::read<float>(humanoid_addr + Offsets::Humanoid::Walkspeed);
                 float current_jump = cradle::memory::read<float>(humanoid_addr + Offsets::Humanoid::JumpHeight);
 
+                bool need_capture = state.capture_next_defaults || !state.defaults_initialized;
+                if (!need_capture)
+                    return;
+
                 state.default_walkspeed = std::isfinite(current_walk) ? current_walk : 16.0f;
                 state.default_jumpheight = std::isfinite(current_jump) ? current_jump : 7.5f;
+
+                if (!state.defaults_initialized)
+                {
+                    state.custom_walkspeed = state.default_walkspeed;
+                    state.custom_jumpheight = state.default_jumpheight;
+                }
+
                 state.defaults_initialized = true;
+                state.capture_next_defaults = false;
             }
 
-            bool ApplyMovementOverride(MovementOverrideState &state,
-                                       const cradle::engine::Player &local_player,
-                                       float target_walk,
-                                       float target_jump,
-                                       bool force_write)
+            bool ApplyWalkspeedOverride(MovementOverrideState &state,
+                                        const cradle::engine::Player &local_player,
+                                        float target_walk,
+                                        bool force_write)
             {
                 if (!local_player.humanoid.is_valid())
+                {
+                    state.last_walk_apply_success = false;
                     return false;
+                }
 
                 auto humanoid_addr = local_player.humanoid.address;
                 float current_walk = cradle::memory::read<float>(humanoid_addr + Offsets::Humanoid::Walkspeed);
                 float current_check = cradle::memory::read<float>(humanoid_addr + Offsets::Humanoid::WalkspeedCheck);
-                float current_jump = cradle::memory::read<float>(humanoid_addr + Offsets::Humanoid::JumpHeight);
-
-                if (state.capture_next_defaults || !state.defaults_initialized)
-                {
-                    state.default_walkspeed = std::isfinite(current_walk) ? current_walk : 16.0f;
-                    state.default_jumpheight = std::isfinite(current_jump) ? current_jump : 7.5f;
-                    state.defaults_initialized = true;
-                }
-                state.capture_next_defaults = false;
 
                 bool need_walk = force_write || !nearly_equal(current_walk, target_walk, kMovementTolerance) || !nearly_equal(current_check, target_walk, kMovementTolerance);
+                if (!need_walk)
+                    return false;
+
+                cradle::memory::write<float>(humanoid_addr + Offsets::Humanoid::Walkspeed, target_walk);
+                cradle::memory::write<float>(humanoid_addr + Offsets::Humanoid::WalkspeedCheck, target_walk);
+
+                float now = static_cast<float>(ImGui::GetTime());
+                state.last_walk_apply_success = true;
+                state.last_walk_apply_value = target_walk;
+                state.last_walk_apply_time = now;
+                return true;
+            }
+
+            bool ApplyJumpHeightOverride(MovementOverrideState &state,
+                                         const cradle::engine::Player &local_player,
+                                         float target_jump,
+                                         bool force_write)
+            {
+                if (!local_player.humanoid.is_valid())
+                {
+                    state.last_jump_apply_success = false;
+                    return false;
+                }
+
+                auto humanoid_addr = local_player.humanoid.address;
+                float current_jump = cradle::memory::read<float>(humanoid_addr + Offsets::Humanoid::JumpHeight);
+
                 bool need_jump = force_write || !nearly_equal(current_jump, target_jump, kMovementTolerance);
+                if (!need_jump)
+                    return false;
 
-                bool wrote = false;
-                if (need_walk)
-                {
-                    cradle::memory::write<float>(humanoid_addr + Offsets::Humanoid::Walkspeed, target_walk);
-                    cradle::memory::write<float>(humanoid_addr + Offsets::Humanoid::WalkspeedCheck, target_walk);
-                    wrote = true;
-                }
-                if (need_jump)
-                {
-                    cradle::memory::write<float>(humanoid_addr + Offsets::Humanoid::JumpHeight, target_jump);
-                    cradle::memory::write<float>(humanoid_addr + Offsets::Humanoid::JumpPower, std::max(target_jump * 3.5f, target_jump));
-                    wrote = true;
-                }
+                cradle::memory::write<float>(humanoid_addr + Offsets::Humanoid::JumpHeight, target_jump);
+                cradle::memory::write<float>(humanoid_addr + Offsets::Humanoid::JumpPower, std::max(target_jump * 3.5f, target_jump));
 
-                if (wrote)
-                {
-                    float now = static_cast<float>(ImGui::GetTime());
-                    state.last_apply_success = true;
-                    state.last_apply_walk = target_walk;
-                    state.last_apply_jump = target_jump;
-                    state.last_apply_time = now;
-                }
-
-                return wrote;
+                float now = static_cast<float>(ImGui::GetTime());
+                state.last_jump_apply_success = true;
+                state.last_jump_apply_value = target_jump;
+                state.last_jump_apply_time = now;
+                return true;
             }
 
             void TickMovementOverrides()
@@ -208,7 +265,8 @@ namespace cradle
                 if (!state.humanoid_ready)
                 {
                     state.defaults_initialized = false;
-                    state.enforce_after_apply = false;
+                    state.enforce_walk_after_apply = false;
+                    state.enforce_jump_after_apply = false;
                     state.capture_next_defaults = false;
                     return;
                 }
@@ -216,10 +274,104 @@ namespace cradle
                 EnsureMovementDefaults(state, local_player);
 
                 double now = ImGui::GetTime();
-                bool should_enforce = state.lock_stats || state.enforce_after_apply;
-                if (should_enforce && (now - state.last_enforce_time) >= kMovementEnforceInterval)
+                bool enforce_walk = state.lock_walkspeed || state.enforce_walk_after_apply;
+                if (enforce_walk && (now - state.last_walk_enforce_time) >= kMovementEnforceInterval)
                 {
-                    ApplyMovementOverride(state, local_player, state.custom_walkspeed, state.custom_jumpheight, false);
+                    bool wrote_walk = ApplyWalkspeedOverride(state, local_player, state.custom_walkspeed, false);
+                    state.enforce_walk_after_apply = state.lock_walkspeed;
+                    state.last_walk_enforce_time = now;
+                    if (!wrote_walk && !state.lock_walkspeed)
+                        state.enforce_walk_after_apply = false;
+                }
+
+                bool enforce_jump = state.lock_jumpheight || state.enforce_jump_after_apply;
+                if (enforce_jump && (now - state.last_jump_enforce_time) >= kMovementEnforceInterval)
+                {
+                    bool wrote_jump = ApplyJumpHeightOverride(state, local_player, state.custom_jumpheight, false);
+                    state.enforce_jump_after_apply = state.lock_jumpheight;
+                    state.last_jump_enforce_time = now;
+                    if (!wrote_jump && !state.lock_jumpheight)
+                        state.enforce_jump_after_apply = false;
+                }
+            }
+
+            bool TryReadWorkspaceGravity(const cradle::engine::Instance &workspace, float &gravity)
+            {
+                if (!workspace.is_valid())
+                    return false;
+
+                auto gravity_container = cradle::memory::read<std::uintptr_t>(workspace.address + Offsets::Workspace::GravityContainer);
+                if (!cradle::memory::IsValid(gravity_container))
+                    return false;
+
+                float current = cradle::memory::read<float>(gravity_container + Offsets::Workspace::Gravity);
+                if (!std::isfinite(current))
+                    return false;
+
+                gravity = current;
+                return true;
+            }
+
+            bool TryWriteWorkspaceGravity(const cradle::engine::Instance &workspace, float gravity)
+            {
+                if (!workspace.is_valid())
+                    return false;
+
+                auto gravity_container = cradle::memory::read<std::uintptr_t>(workspace.address + Offsets::Workspace::GravityContainer);
+                if (!cradle::memory::IsValid(gravity_container))
+                    return false;
+
+                cradle::memory::write<float>(gravity_container + Offsets::Workspace::Gravity, gravity);
+                return true;
+            }
+
+            void EnsureGravityDefaults(GravityOverrideState &state, const cradle::engine::Instance &workspace)
+            {
+                if (state.defaults_initialized)
+                    return;
+
+                float current = 0.0f;
+                if (TryReadWorkspaceGravity(workspace, current))
+                {
+                    state.default_gravity = current;
+                    state.custom_gravity = current;
+                    state.defaults_initialized = true;
+                }
+            }
+
+            void TickGravityOverride()
+            {
+                auto &state = g_gravity_override_state;
+                auto dm_instance = cradle::engine::DataModel::get_instance();
+                auto workspace = dm_instance.get_workspace();
+
+                state.workspace_ready = workspace.is_valid();
+                if (!state.workspace_ready)
+                {
+                    state.defaults_initialized = false;
+                    state.enforce_after_apply = false;
+                    return;
+                }
+
+                EnsureGravityDefaults(state, workspace);
+
+                double now = ImGui::GetTime();
+                bool should_enforce = state.lock_gravity || state.enforce_after_apply;
+                if (should_enforce && (now - state.last_enforce_time) >= kGravityEnforceInterval)
+                {
+                    if (TryWriteWorkspaceGravity(workspace, state.custom_gravity))
+                    {
+                        state.last_apply_success = true;
+                        state.last_apply_value = state.custom_gravity;
+                        state.last_apply_time = static_cast<float>(now);
+                        state.enforce_after_apply = state.lock_gravity;
+                    }
+                    else
+                    {
+                        state.last_apply_success = false;
+                        state.enforce_after_apply = false;
+                    }
+
                     state.last_enforce_time = now;
                 }
             }
@@ -341,7 +493,10 @@ namespace cradle
 
                                 void RenderModulePanel(evo::child_t *child, cradle::modules::Module *module);
                                 void RenderEspSettings(evo::child_t *child, cradle::modules::Module *module);
-                                void RenderMemoryPanel(evo::child_t *child);
+                                void RenderMemoryPanel(evo::child_t *child, MemoryPanelSection section);
+                                void RenderWalkspeedMemorySection(evo::child_t *child);
+                                void RenderJumpHeightMemorySection(evo::child_t *child);
+                                void RenderGravityMemorySection(evo::child_t *child);
                                 void RenderVisualColorPanel(evo::child_t *child);
                                 void RenderProfilingPanel(evo::child_t *child, cradle::modules::Module *module);
                                 void RenderConfigTab(evo::window_t *window);
@@ -388,7 +543,9 @@ namespace cradle
 
                                     if (tab == EvoTab::Misc)
                                     {
-                                        entries.push_back({"MemoryWrite", nullptr, true});
+                                        entries.push_back({"Walkspeed override", nullptr, MemoryPanelSection::Walkspeed});
+                                        entries.push_back({"Jump height override", nullptr, MemoryPanelSection::JumpHeight});
+                                        entries.push_back({"Gravity override", nullptr, MemoryPanelSection::Gravity});
                                     }
 
                                     for (auto *mod : modules)
@@ -399,7 +556,7 @@ namespace cradle
                                         std::string label = mod->get_name();
                                         if (!label.empty())
                                             label[0] = static_cast<char>(std::toupper(static_cast<unsigned char>(label[0])));
-                                        entries.push_back({label, mod, false});
+                                        entries.push_back({label, mod, MemoryPanelSection::None});
                                     }
 
                                     int &selected_idx = g_tab_selection[tab_index];
@@ -434,13 +591,17 @@ namespace cradle
                                     delete module_child;
 
                                     g_memory_view_active = false;
+                                    g_memory_view_section = MemoryPanelSection::None;
                                     g_selected_module = nullptr;
 
                                     if (!entries.empty() && selected_idx >= 0 && selected_idx < static_cast<int>(entries.size()))
                                     {
                                         const auto &entry = entries[selected_idx];
-                                        if (entry.is_memory)
+                                        if (entry.memory_section != MemoryPanelSection::None)
+                                        {
                                             g_memory_view_active = true;
+                                            g_memory_view_section = entry.memory_section;
+                                        }
                                         else
                                             g_selected_module = entry.module;
                                     }
@@ -450,7 +611,7 @@ namespace cradle
                                         window->make_child(settings_child);
                                         if (g_memory_view_active && tab == EvoTab::Misc)
                                         {
-                                            RenderMemoryPanel(settings_child);
+                                            RenderMemoryPanel(settings_child, g_memory_view_section);
                                         }
                                         else if (g_selected_module)
                                         {
@@ -1041,77 +1202,226 @@ namespace cradle
                                     delete actions_child;
                                 }
 
-                                void RenderMemoryPanel(evo::child_t *child)
+                                void RenderWalkspeedMemorySection(evo::child_t *child)
                                 {
-                                    child->make_text("MemoryWrite · risky");
-                                    child->make_text("Direct movement stat overrides");
-
                                     auto &state = g_movement_override_state;
-
-                                    child->make_slider_float("walkspeed", &state.custom_walkspeed, 4.0f, 250.0f, "");
-                                    child->make_slider_float("jump height", &state.custom_jumpheight, 4.0f, 200.0f, "");
-                                    child->make_checkbox("lock + auto apply", &state.lock_stats);
+                                    child->make_text("Walkspeed overrides");
 
                                     auto local_player = cradle::engine::PlayerCache::get_local_player();
                                     EnsureMovementDefaults(state, local_player);
-
                                     bool humanoid_ready = local_player.humanoid.is_valid();
                                     state.humanoid_ready = humanoid_ready;
                                     child->make_text(humanoid_ready ? "humanoid ready" : "humanoid missing");
 
-                                    child->make_button("apply now", [&]() {
-                                        if (!humanoid_ready)
+                                    child->make_slider_float("walkspeed##memwrite", &state.custom_walkspeed, 4.0f, 250.0f, "");
+                                    child->make_checkbox("lock walkspeed", &state.lock_walkspeed);
+
+                                    child->make_button("apply walkspeed", [&]() {
+                                        auto player = cradle::engine::PlayerCache::get_local_player();
+                                        if (!player.humanoid.is_valid())
                                         {
-                                            state.last_apply_success = false;
+                                            state.last_walk_apply_success = false;
+                                            state.enforce_walk_after_apply = false;
                                             return;
                                         }
 
                                         state.capture_next_defaults = true;
-                                        bool applied = ApplyMovementOverride(state, local_player, state.custom_walkspeed, state.custom_jumpheight, true);
-                                        state.last_apply_success = applied;
-                                        state.enforce_after_apply = true;
-                                        state.last_enforce_time = ImGui::GetTime();
+                                        EnsureMovementDefaults(state, player);
+                                        bool applied = ApplyWalkspeedOverride(state, player, state.custom_walkspeed, true);
+                                        state.last_walk_apply_success = applied;
+                                        state.enforce_walk_after_apply = true;
+                                        state.last_walk_enforce_time = ImGui::GetTime();
                                     });
 
                                     if (state.defaults_initialized)
                                     {
-                                        child->make_button("reset to default", [&]() {
-                                            if (!humanoid_ready)
+                                        child->make_button("reset walkspeed", [&]() {
+                                            auto player = cradle::engine::PlayerCache::get_local_player();
+                                            if (!player.humanoid.is_valid())
                                             {
-                                                state.enforce_after_apply = false;
-                                                state.last_apply_success = false;
+                                                state.enforce_walk_after_apply = false;
+                                                state.last_walk_apply_success = false;
                                                 return;
                                             }
 
                                             state.custom_walkspeed = state.default_walkspeed;
-                                            state.custom_jumpheight = state.default_jumpheight;
-                                            bool applied = ApplyMovementOverride(state, local_player, state.default_walkspeed, state.default_jumpheight, true);
-                                            state.last_apply_success = applied;
-                                            state.enforce_after_apply = false;
+                                            bool applied = ApplyWalkspeedOverride(state, player, state.default_walkspeed, true);
+                                            state.last_walk_apply_success = applied;
+                                            state.enforce_walk_after_apply = false;
                                         });
-                                    }
 
-                                    if (state.defaults_initialized)
-                                    {
-                                        char defaults_buf[96];
-                                        std::snprintf(defaults_buf, sizeof(defaults_buf), "default walk %.1f · jump %.1f",
-                                                      state.default_walkspeed,
-                                                      state.default_jumpheight);
+                                        char defaults_buf[64];
+                                        std::snprintf(defaults_buf, sizeof(defaults_buf), "default walk %.1f", state.default_walkspeed);
                                         child->make_text(defaults_buf);
                                     }
 
-                                    if (state.last_apply_success)
+                                    if (state.last_walk_apply_success)
                                     {
-                                        char buffer[128];
-                                        std::snprintf(buffer, sizeof(buffer), "applied %.1f walk / %.1f jump · %.1fs ago",
-                                                      state.last_apply_walk,
-                                                      state.last_apply_jump,
-                                                      static_cast<float>(ImGui::GetTime()) - state.last_apply_time);
+                                        char buffer[96];
+                                        std::snprintf(buffer, sizeof(buffer), "walk %.1f applied %.1fs ago",
+                                                      state.last_walk_apply_value,
+                                                      static_cast<float>(ImGui::GetTime()) - state.last_walk_apply_time);
                                         child->make_text(buffer);
                                     }
                                     else if (!humanoid_ready)
                                     {
-                                        child->make_text("spawn in-game to enable risky writes");
+                                        child->make_text("spawn in-game to edit walkspeed");
+                                    }
+                                }
+
+                                void RenderJumpHeightMemorySection(evo::child_t *child)
+                                {
+                                    auto &state = g_movement_override_state;
+                                    child->make_text("Jump height overrides");
+
+                                    auto local_player = cradle::engine::PlayerCache::get_local_player();
+                                    EnsureMovementDefaults(state, local_player);
+                                    bool humanoid_ready = local_player.humanoid.is_valid();
+                                    state.humanoid_ready = humanoid_ready;
+                                    child->make_text(humanoid_ready ? "humanoid ready" : "humanoid missing");
+
+                                    child->make_slider_float("jump height##memwrite", &state.custom_jumpheight, 4.0f, 200.0f, "");
+                                    child->make_checkbox("lock jump height", &state.lock_jumpheight);
+
+                                    child->make_button("apply jump height", [&]() {
+                                        auto player = cradle::engine::PlayerCache::get_local_player();
+                                        if (!player.humanoid.is_valid())
+                                        {
+                                            state.last_jump_apply_success = false;
+                                            state.enforce_jump_after_apply = false;
+                                            return;
+                                        }
+
+                                        state.capture_next_defaults = true;
+                                        EnsureMovementDefaults(state, player);
+                                        bool applied = ApplyJumpHeightOverride(state, player, state.custom_jumpheight, true);
+                                        state.last_jump_apply_success = applied;
+                                        state.enforce_jump_after_apply = true;
+                                        state.last_jump_enforce_time = ImGui::GetTime();
+                                    });
+
+                                    if (state.defaults_initialized)
+                                    {
+                                        child->make_button("reset jump height", [&]() {
+                                            auto player = cradle::engine::PlayerCache::get_local_player();
+                                            if (!player.humanoid.is_valid())
+                                            {
+                                                state.enforce_jump_after_apply = false;
+                                                state.last_jump_apply_success = false;
+                                                return;
+                                            }
+
+                                            state.custom_jumpheight = state.default_jumpheight;
+                                            bool applied = ApplyJumpHeightOverride(state, player, state.default_jumpheight, true);
+                                            state.last_jump_apply_success = applied;
+                                            state.enforce_jump_after_apply = false;
+                                        });
+
+                                        char defaults_buf[64];
+                                        std::snprintf(defaults_buf, sizeof(defaults_buf), "default jump %.1f", state.default_jumpheight);
+                                        child->make_text(defaults_buf);
+                                    }
+
+                                    if (state.last_jump_apply_success)
+                                    {
+                                        char buffer[96];
+                                        std::snprintf(buffer, sizeof(buffer), "jump %.1f applied %.1fs ago",
+                                                      state.last_jump_apply_value,
+                                                      static_cast<float>(ImGui::GetTime()) - state.last_jump_apply_time);
+                                        child->make_text(buffer);
+                                    }
+                                    else if (!humanoid_ready)
+                                    {
+                                        child->make_text("spawn in-game to edit jump height");
+                                    }
+                                }
+
+                                void RenderGravityMemorySection(evo::child_t *child)
+                                {
+                                    auto &gravity_state = g_gravity_override_state;
+                                    child->make_text("Gravity overrides");
+
+                                    child->make_slider_float("gravity##memwrite", &gravity_state.custom_gravity, 0.0f, 500.0f, "");
+                                    child->make_checkbox("lock gravity", &gravity_state.lock_gravity);
+                                    child->make_text(gravity_state.workspace_ready ? "workspace ready" : "workspace missing");
+
+                                    child->make_button("apply gravity", [&]() {
+                                        auto dm_instance = cradle::engine::DataModel::get_instance();
+                                        auto workspace = dm_instance.get_workspace();
+
+                                        if (!TryWriteWorkspaceGravity(workspace, gravity_state.custom_gravity))
+                                        {
+                                            gravity_state.last_apply_success = false;
+                                            gravity_state.enforce_after_apply = false;
+                                            return;
+                                        }
+
+                                        gravity_state.last_apply_success = true;
+                                        gravity_state.last_apply_value = gravity_state.custom_gravity;
+                                        gravity_state.last_apply_time = static_cast<float>(ImGui::GetTime());
+                                        gravity_state.last_enforce_time = ImGui::GetTime();
+                                        gravity_state.enforce_after_apply = true;
+                                    });
+
+                                    if (gravity_state.defaults_initialized)
+                                    {
+                                        child->make_button("reset gravity", [&]() {
+                                            auto dm_instance = cradle::engine::DataModel::get_instance();
+                                            auto workspace = dm_instance.get_workspace();
+
+                                            if (!TryWriteWorkspaceGravity(workspace, gravity_state.default_gravity))
+                                            {
+                                                gravity_state.last_apply_success = false;
+                                                gravity_state.enforce_after_apply = false;
+                                                return;
+                                            }
+
+                                            gravity_state.custom_gravity = gravity_state.default_gravity;
+                                            gravity_state.last_apply_success = true;
+                                            gravity_state.last_apply_value = gravity_state.default_gravity;
+                                            gravity_state.last_apply_time = static_cast<float>(ImGui::GetTime());
+                                            gravity_state.last_enforce_time = ImGui::GetTime();
+                                            gravity_state.enforce_after_apply = false;
+                                        });
+
+                                        char gravity_defaults[96];
+                                        std::snprintf(gravity_defaults, sizeof(gravity_defaults), "default gravity %.1f",
+                                                      gravity_state.default_gravity);
+                                        child->make_text(gravity_defaults);
+                                    }
+
+                                    if (gravity_state.last_apply_success)
+                                    {
+                                        char buffer[128];
+                                        std::snprintf(buffer, sizeof(buffer), "gravity %.1f applied %.1fs ago",
+                                                      gravity_state.last_apply_value,
+                                                      static_cast<float>(ImGui::GetTime()) - gravity_state.last_apply_time);
+                                        child->make_text(buffer);
+                                    }
+                                    else if (!gravity_state.workspace_ready)
+                                    {
+                                        child->make_text("join a game to edit gravity");
+                                    }
+                                }
+
+                                void RenderMemoryPanel(evo::child_t *child, MemoryPanelSection section)
+                                {
+                                    child->make_text("MemoryWrite · risky");
+
+                                    switch (section)
+                                    {
+                                    case MemoryPanelSection::Walkspeed:
+                                        RenderWalkspeedMemorySection(child);
+                                        break;
+                                    case MemoryPanelSection::JumpHeight:
+                                        RenderJumpHeightMemorySection(child);
+                                        break;
+                                    case MemoryPanelSection::Gravity:
+                                        RenderGravityMemorySection(child);
+                                        break;
+                                    default:
+                                        child->make_text("Select a memory override module on the left.");
+                                        break;
                                     }
                                 }
                             } // namespace
@@ -1427,6 +1737,7 @@ namespace cradle
 
                                 cradle::engine::PlayerCache::update_cache();
                                 TickMovementOverrides();
+                                TickGravityOverride();
 
                                 static auto last_wall_cache_tick = std::chrono::steady_clock::time_point{};
                                 auto now = std::chrono::steady_clock::now();
