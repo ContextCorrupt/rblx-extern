@@ -9,5 +9,6 @@ namespace cradle::modules
     public:
         ProfilingModule();
         void on_render() override;
+        bool allow_render_when_disabled() override;
     };
 }

@@ -9,6 +9,9 @@
 
 extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
 #include <spdlog/spdlog.h>
+#include <spdlog/sinks/base_sink.h>
+#include <spdlog/fmt/ostr.h>
+#include <fmt/format.h>
 #include <cstdarg>
 #include <cstdio>
 #include <algorithm>
@@ -16,6 +19,9 @@ extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd, UINT msg
 #include <chrono>
 #include <cmath>
 #include <cctype>
+#include <deque>
+#include <filesystem>
+#include <fstream>
 #include <functional>
 #include <tlhelp32.h>
 #include <string>
@@ -1075,27 +1081,280 @@ namespace cradle
                                     }
                                 }
 
-                                void RenderLoadingOverlay(Overlay::LoadingStage stage, const std::string &message)
+                                static constexpr float kLoadingOverlayWidth = 640.0f;
+                                static constexpr float kLoadingOverlayHeight = 360.0f;
+                                static bool g_loader_capture_requested = false;
+                                static ImRect g_loader_bounds(ImVec2(0.0f, 0.0f), ImVec2(0.0f, 0.0f));
+
+                                static constexpr int kLoadingStageCount = 4;
+                                static constexpr std::size_t kLoaderLogCapacity = 64;
+
+                                static std::mutex g_loader_log_mutex;
+                                static std::deque<std::string> g_loader_log_lines;
+
+                                static const char *LoadingStageDisplayText(Overlay::LoadingStage stage)
                                 {
-                                    ImGuiViewport *viewport = ImGui::GetMainViewport();
-                                    if (!viewport)
+                                    switch (stage)
+                                    {
+                                    case Overlay::LoadingStage::WaitingForRoblox:
+                                        return "waiting";
+                                    case Overlay::LoadingStage::Attaching:
+                                        return "attaching";
+                                    case Overlay::LoadingStage::Initializing:
+                                        return "initializing";
+                                    case Overlay::LoadingStage::Ready:
+                                        return "ready";
+                                    case Overlay::LoadingStage::Failed:
+                                        return "failed";
+                                    default:
+                                        return "unknown";
+                                    }
+                                }
+
+                                static int LoadingStageToIndex(Overlay::LoadingStage stage)
+                                {
+                                    switch (stage)
+                                    {
+                                    case Overlay::LoadingStage::WaitingForRoblox:
+                                        return 0;
+                                    case Overlay::LoadingStage::Attaching:
+                                        return 1;
+                                    case Overlay::LoadingStage::Initializing:
+                                        return 2;
+                                    case Overlay::LoadingStage::Ready:
+                                        return 3;
+                                    case Overlay::LoadingStage::Failed:
+                                        return 4;
+                                    default:
+                                        return 0;
+                                    }
+                                }
+
+                                static void AppendLoaderLogLine(const std::string &line)
+                                {
+                                    std::lock_guard<std::mutex> lock(g_loader_log_mutex);
+                                    g_loader_log_lines.push_back(line);
+                                    while (g_loader_log_lines.size() > kLoaderLogCapacity)
+                                        g_loader_log_lines.pop_front();
+                                }
+
+                                class BootstrapConsoleSink : public spdlog::sinks::base_sink<std::mutex>
+                                {
+                                protected:
+                                    void sink_it_(const spdlog::details::log_msg &msg) override
+                                    {
+                                        spdlog::memory_buf_t buf;
+                                        formatter_->format(msg, buf);
+                                        AppendLoaderLogLine(fmt::to_string(buf));
+                                    }
+
+                                    void flush_() override {}
+                                };
+
+                                static void InstallBootstrapConsoleSink()
+                                {
+                                    static bool installed = false;
+                                    if (installed)
                                         return;
 
-                                    ImDrawList *loading_draw_list = ImGui::GetForegroundDrawList();
-                                    if (!loading_draw_list)
+                                    auto sink = std::make_shared<BootstrapConsoleSink>();
+                                    sink->set_pattern("[%H:%M:%S] %v");
+                                    auto logger = std::make_shared<spdlog::logger>("bootstrap", sink);
+                                    logger->set_pattern("[%H:%M:%S] %v");
+                                    logger->set_level(spdlog::level::info);
+                                    spdlog::set_default_logger(logger);
+                                    installed = true;
+                                }
+
+                                static std::vector<std::string> GetLoaderLogSnapshot()
+                                {
+                                    std::lock_guard<std::mutex> lock(g_loader_log_mutex);
+                                    return std::vector<std::string>(g_loader_log_lines.begin(), g_loader_log_lines.end());
+                                }
+
+                                static std::filesystem::path GetLoaderLogFilePath()
+                                {
+                                    std::filesystem::path base = std::filesystem::current_path();
+                                    base /= "logs";
+                                    return base / "bootstrap_console.txt";
+                                }
+
+                                static bool ExportLoaderLogs()
+                                {
+                                    auto lines = GetLoaderLogSnapshot();
+                                    auto path = GetLoaderLogFilePath();
+                                    std::error_code ec;
+                                    if (!path.parent_path().empty())
+                                        std::filesystem::create_directories(path.parent_path(), ec);
+
+                                    std::ofstream file(path, std::ios::trunc);
+                                    if (!file.is_open())
+                                    {
+                                        AppendLoaderLogLine("failed to export bootstrap log (file error)");
+                                        return false;
+                                    }
+
+                                    file << "bootstrap console log" << std::endl
+                                         << "----------------------" << std::endl;
+                                    for (const auto &line : lines)
+                                        file << line << std::endl;
+                                    file.close();
+
+                                    AppendLoaderLogLine(std::string("exported bootstrap log to ") + path.string());
+                                    return true;
+                                }
+
+                                static void EnsureConsoleHidden()
+                                {
+                                    static bool hidden = false;
+                                    if (hidden)
                                         return;
 
-                                    ImVec2 screen_min = viewport->Pos;
-                                    ImVec2 screen_max = viewport->Pos + viewport->Size;
-                                    loading_draw_list->AddRectFilled(screen_min, screen_max, IM_COL32(5, 5, 5, 195));
+                                    HWND console = GetConsoleWindow();
+                                    if (!console)
+                                        return;
 
-                                    ImVec2 center((screen_min.x + screen_max.x) * 0.5f, (screen_min.y + screen_max.y) * 0.5f);
-                                    ImVec2 box_size(360.0f, 160.0f);
-                                    ImVec2 box_min(center.x - box_size.x * 0.5f, center.y - box_size.y * 0.5f);
-                                    ImVec2 box_max(center.x + box_size.x * 0.5f, center.y + box_size.y * 0.5f);
+                                    ShowWindow(console, SW_HIDE);
+                                    hidden = true;
+                                }
 
-                                    loading_draw_list->AddRectFilled(box_min, box_max, IM_COL32(18, 18, 18, 240), 12.0f);
-                                    loading_draw_list->AddRect(box_min, box_max, IM_COL32(255, 255, 255, 40), 12.0f);
+                                static std::string CollapseWhitespace(const std::string &text)
+                                {
+                                    if (text.empty())
+                                        return text;
+
+                                    std::string result;
+                                    result.reserve(text.size());
+                                    bool previous_space = true;
+                                    for (char ch : text)
+                                    {
+                                        char c = ch;
+                                        if (c == '\n' || c == '\r' || c == '\t')
+                                            c = ' ';
+
+                                        if (c == ' ')
+                                        {
+                                            if (previous_space)
+                                                continue;
+                                            previous_space = true;
+                                        }
+                                        else
+                                        {
+                                            previous_space = false;
+                                        }
+
+                                        result.push_back(c);
+                                    }
+
+                                    while (!result.empty() && result.back() == ' ')
+                                        result.pop_back();
+
+                                    return result;
+                                }
+
+                                static std::vector<std::string> WrapText(const std::string &text, std::size_t max_chars)
+                                {
+                                    std::vector<std::string> lines;
+                                    if (text.empty())
+                                    {
+                                        lines.emplace_back();
+                                        return lines;
+                                    }
+
+                                    std::istringstream stream(text);
+                                    std::string word;
+                                    std::string current;
+                                    while (stream >> word)
+                                    {
+                                        if (current.empty())
+                                        {
+                                            current = word;
+                                            continue;
+                                        }
+
+                                        if (current.size() + 1 + word.size() <= max_chars)
+                                        {
+                                            current.push_back(' ');
+                                            current += word;
+                                        }
+                                        else
+                                        {
+                                            lines.push_back(current);
+                                            current = word;
+                                        }
+                                    }
+
+                                    if (!current.empty())
+                                        lines.push_back(current);
+
+                                    if (lines.empty())
+                                        lines.emplace_back();
+
+                                    return lines;
+                                }
+
+                                static std::string BuildConsoleTextboxContent(const std::vector<std::string> &log_lines,
+                                                                                const std::string &status_line,
+                                                                                const char *stage_text,
+                                                                                const char *progress_label,
+                                                                                const char *hint,
+                                                                                bool failed,
+                                                                                bool ready)
+                                {
+                                    std::string text;
+                                    text.reserve(1024);
+
+                                    text += "bootstrap console\n";
+                                    text += std::string("stage · ") + stage_text + "\n";
+                                    text += std::string("progress · ") + progress_label + "\n";
+                                    text += std::string("status · ") + CollapseWhitespace(status_line) + "\n\n";
+
+                                    if (log_lines.empty())
+                                    {
+                                        text += "• awaiting loader events...\n\n";
+                                    }
+                                    else
+                                    {
+                                        for (const auto &line : log_lines)
+                                        {
+                                            auto wrapped = WrapText(line, 64);
+                                            if (wrapped.empty())
+                                                continue;
+
+                                            bool is_entry_head = true;
+                                            for (const auto &piece : wrapped)
+                                            {
+                                                text += is_entry_head ? "• " : "  ";
+                                                text += piece;
+                                                text += '\n';
+                                                is_entry_head = false;
+                                            }
+                                            text += '\n';
+                                        }
+                                    }
+
+                                    text += std::string("hint · ") + CollapseWhitespace(hint) + '\n';
+                                    if (failed)
+                                        text += "action · restart Roblox and relaunch the loader\n";
+                                    else if (ready)
+                                        text += "action · press Delete to open the menu\n";
+                                    else
+                                        text += "action · no input required\n";
+                                    text += "controls · Delete opens the menu once in-game";
+
+                                    return text;
+                                }
+
+                                static void RenderLoadingWindowContent(evo::window_t *window,
+                                                                        Overlay::LoadingStage stage,
+                                                                        const std::string &raw_message)
+                                {
+                                    constexpr int kLoaderTabIndex = 0;
+
+                                    const bool failed = stage == Overlay::LoadingStage::Failed;
+                                    const bool ready = stage == Overlay::LoadingStage::Ready;
+                                    int stage_index = LoadingStageToIndex(stage);
+                                    int visual_stage_index = std::clamp(stage_index, 0, kLoadingStageCount - 1);
 
                                     const char *stage_text = "loading";
                                     switch (stage)
@@ -1107,7 +1366,7 @@ namespace cradle
                                         stage_text = "roblox detected";
                                         break;
                                     case Overlay::LoadingStage::Initializing:
-                                        stage_text = "loading cheat";
+                                        stage_text = "initializing modules";
                                         break;
                                     case Overlay::LoadingStage::Ready:
                                         stage_text = "ready";
@@ -1117,32 +1376,134 @@ namespace cradle
                                         break;
                                     }
 
-                                    std::string details = message;
-                                    if (details.empty())
-                                        details = "preparing environment...";
-                                    ImU32 stage_color = stage == Overlay::LoadingStage::Failed ? IM_COL32(255, 120, 120, 255) : IM_COL32(255, 255, 255, 255);
-                                    ImVec2 stage_pos(box_min.x + 32.0f, box_min.y + 32.0f);
-                                    loading_draw_list->AddText(stage_pos, stage_color, stage_text);
-                                    ImVec2 detail_pos(stage_pos.x, stage_pos.y + 28.0f);
-                                    loading_draw_list->AddText(detail_pos, IM_COL32(185, 185, 185, 255), details.c_str());
-                                    ImVec2 tip_pos(stage_pos.x, detail_pos.y + 26.0f);
-                                    loading_draw_list->AddText(tip_pos, IM_COL32(130, 130, 130, 255), "Overlay activates automatically when ready.");
+                                    std::string collapsed_message = CollapseWhitespace(raw_message);
+                                    if (collapsed_message.empty())
+                                        collapsed_message = "Preparing environment...";
 
-                                    float spinner_radius = 18.0f;
-                                    ImVec2 spinner_center(box_max.x - 48.0f, box_min.y + 42.0f);
-                                    float time = static_cast<float>(ImGui::GetTime());
-                                    float start_angle = time * 4.3f;
-                                    float sweep = IM_PI * 1.45f;
-                                    int segments = 64;
-                                    loading_draw_list->PathClear();
-                                    for (int i = 0; i <= segments; ++i)
+                                    const char *hint = failed ? "Something interrupted the attachment sequence. Restart Roblox and relaunch the loader."
+                                                              : "Overlay enables itself automatically once the runtime is ready.";
+
+                                    float progress_fraction = 0.0f;
+                                    if constexpr (kLoadingStageCount > 1)
+                                        progress_fraction = static_cast<float>(visual_stage_index) / static_cast<float>(kLoadingStageCount - 1);
+                                    progress_fraction = std::clamp(progress_fraction, 0.0f, 1.0f);
+                                    int progress_pct = static_cast<int>(std::round(progress_fraction * 100.0f));
+                                    progress_pct = std::clamp(progress_pct, 0, 100);
+                                    char progress_label[32];
+                                    std::snprintf(progress_label, sizeof(progress_label), "%d%%", progress_pct);
+
+                                    auto console_child = new evo::child_t("bootstrap console", 0, evo::child_pos_t::_top_left, evo::child_size_t::_full, kLoaderTabIndex);
+                                    console_child->full_child();
                                     {
-                                        float angle = start_angle + sweep * (static_cast<float>(i) / static_cast<float>(segments));
-                                        loading_draw_list->PathLineTo(ImVec2(spinner_center.x + std::cos(angle) * spinner_radius,
-                                                                     spinner_center.y + std::sin(angle) * spinner_radius));
+                                        window->make_child(console_child);
+                                        auto log_lines = GetLoaderLogSnapshot();
+                                        std::string console_block = BuildConsoleTextboxContent(log_lines, collapsed_message, stage_text, progress_label, hint, failed, ready);
+                                        float available_height = std::max(0.0f, console_child->get_content_height() - 55.0f);
+                                        console_child->make_text(console_block, available_height);
+                                        console_child->make_button("export console log", []() {
+                                            ExportLoaderLogs();
+                                        });
+                                        console_child->enable_scrolling();
                                     }
-                                    ImU32 spinner_color = stage == Overlay::LoadingStage::Failed ? IM_COL32(255, 120, 120, 255) : IM_COL32(120, 190, 255, 255);
-                                    loading_draw_list->PathStroke(spinner_color, false, 4.0f);
+                                    delete console_child;
+                                }
+
+                                static void RenderLoadingOverlay(Overlay::LoadingStage stage, const std::string &message)
+                                {
+                                    ImGuiViewport *viewport = ImGui::GetMainViewport();
+                                    if (!viewport)
+                                        return;
+
+                                    g_loader_capture_requested = false;
+                                    EnsureConsoleHidden();
+
+                                    const evo::vec2_t window_size(kLoadingOverlayWidth, kLoadingOverlayHeight);
+                                    static evo::vec2_t loader_pos(0.0f, 0.0f);
+                                    static evo::vec2_t last_pos_recorded(0.0f, 0.0f);
+                                    static ImVec2 last_viewport_size(0.0f, 0.0f);
+                                    static bool seed_position = false;
+                                    static bool user_moved = false;
+                                    static Overlay::LoadingStage last_stage = Overlay::LoadingStage::WaitingForRoblox;
+
+                                    ImVec2 viewport_center = viewport->Pos + viewport->Size * 0.5f;
+                                    evo::vec2_t centered_pos(viewport_center.x - window_size.x * 0.5f,
+                                                             viewport_center.y - window_size.y * 0.5f);
+
+                                    bool viewport_changed = (last_viewport_size.x != viewport->Size.x || last_viewport_size.y != viewport->Size.y);
+                                    if (!seed_position || (!user_moved && viewport_changed))
+                                    {
+                                        loader_pos = centered_pos;
+                                        last_pos_recorded = loader_pos;
+                                        seed_position = true;
+                                    }
+
+                                    if (stage == Overlay::LoadingStage::WaitingForRoblox && last_stage == Overlay::LoadingStage::Ready)
+                                    {
+                                        loader_pos = centered_pos;
+                                        last_pos_recorded = loader_pos;
+                                        user_moved = false;
+                                    }
+
+                                    last_viewport_size = viewport->Size;
+                                    last_stage = stage;
+
+                                    float min_x = viewport->Pos.x + 12.0f;
+                                    float min_y = viewport->Pos.y + 12.0f;
+                                    float max_x = viewport->Pos.x + viewport->Size.x - window_size.x - 12.0f;
+                                    float max_y = viewport->Pos.y + viewport->Size.y - window_size.y - 12.0f;
+                                    if (max_x < min_x)
+                                        max_x = min_x;
+                                    if (max_y < min_y)
+                                        max_y = min_y;
+
+                                    loader_pos.x = std::clamp(loader_pos.x, min_x, max_x);
+                                    loader_pos.y = std::clamp(loader_pos.y, min_y, max_y);
+
+                                    static int loader_tab = 0;
+                                    static const std::vector<std::string> loader_tabs = {};
+
+                                    const auto prev_orx = evo::theme::orx;
+                                    const auto prev_ory = evo::theme::ory;
+                                    const auto prev_rx = evo::theme::rx;
+                                    const auto prev_ry = evo::theme::ry;
+                                    const auto prev_menu_size = evo::theme::menu_size;
+                                    bool prev_menu_resizable = evo::theme::menu_resizable;
+
+                                    evo::theme::orx = static_cast<int>(window_size.x);
+                                    evo::theme::ory = static_cast<int>(window_size.y);
+                                    evo::theme::rx = static_cast<int>(window_size.x);
+                                    evo::theme::ry = static_cast<int>(window_size.y);
+                                    evo::theme::menu_size = window_size;
+                                    evo::theme::menu_resizable = false;
+
+                                    g_loader_bounds = ImRect(ImVec2(loader_pos.x, loader_pos.y),
+                                                             ImVec2(loader_pos.x + window_size.x, loader_pos.y + window_size.y));
+
+                                    auto loader_window = new evo::window_t("bootstrap", &loader_pos, window_size, loader_tabs, &loader_tab);
+                                    {
+                                        RenderLoadingWindowContent(loader_window, stage, message);
+                                    }
+                                    delete loader_window;
+
+                                    ImGuiIO &io = ImGui::GetIO();
+                                    if (io.MousePos.x >= g_loader_bounds.Min.x && io.MousePos.x <= g_loader_bounds.Max.x &&
+                                        io.MousePos.y >= g_loader_bounds.Min.y && io.MousePos.y <= g_loader_bounds.Max.y)
+                                    {
+                                        g_loader_capture_requested = true;
+                                    }
+
+                                    if (std::fabs(loader_pos.x - last_pos_recorded.x) > 0.5f || std::fabs(loader_pos.y - last_pos_recorded.y) > 0.5f)
+                                    {
+                                        user_moved = true;
+                                        last_pos_recorded = loader_pos;
+                                    }
+
+                                    evo::theme::orx = prev_orx;
+                                    evo::theme::ory = prev_ory;
+                                    evo::theme::rx = prev_rx;
+                                    evo::theme::ry = prev_ry;
+                                    evo::theme::menu_size = prev_menu_size;
+                                    evo::theme::menu_resizable = prev_menu_resizable;
                                 }
 
                                 void RenderProfilingPanel(evo::child_t *child, cradle::modules::Module *module)
@@ -1513,6 +1874,12 @@ namespace cradle
                                     std::lock_guard<std::mutex> lock(loading_message_mutex);
                                     loading_message = message;
                                 }
+
+                                std::string collapsed = CollapseWhitespace(message);
+                                if (collapsed.empty())
+                                    collapsed = "Updating...";
+                                std::string log_entry = std::string("[") + LoadingStageDisplayText(stage) + "] " + collapsed;
+                                AppendLoaderLogLine(log_entry);
                             }
 
                             Overlay::LoadingStage Overlay::get_loading_stage()
@@ -1544,6 +1911,8 @@ namespace cradle
                                     return true;
 
                                 instance = this;
+                                InstallBootstrapConsoleSink();
+                                EnsureConsoleHidden();
                                 createWindow();
                                 if (!overlayWindow)
                                 {
@@ -1565,7 +1934,7 @@ namespace cradle
                                     return false;
                                 }
 
-                                updateInputPassthrough();
+                                updateInputPassthrough(false);
                                 return true;
                             }
 
@@ -1757,13 +2126,17 @@ namespace cradle
                                     SWP_NOACTIVATE | SWP_SHOWWINDOW);
                             }
 
-                            void Overlay::updateInputPassthrough()
+                            void Overlay::updateInputPassthrough(bool capture_input)
                             {
                                 if (!overlayWindow)
                                     return;
 
+                                static bool last_capture_state = false;
+                                if (capture_input == last_capture_state)
+                                    return;
+
                                 LONG_PTR ex_style = GetWindowLongPtr(overlayWindow, GWL_EXSTYLE);
-                                if (menu_visible)
+                                if (capture_input)
                                 {
                                     ex_style &= ~WS_EX_TRANSPARENT;
                                 }
@@ -1781,6 +2154,7 @@ namespace cradle
                                     0,
                                     0,
                                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_FRAMECHANGED | SWP_NOOWNERZORDER);
+                                last_capture_state = capture_input;
                             }
 
                             void Overlay::render()
@@ -1802,30 +2176,48 @@ namespace cradle
                                 ImGui_ImplWin32_NewFrame();
                                 ImGui::NewFrame();
 
+                                auto stage = Overlay::get_loading_stage();
+                                auto loading_text = Overlay::get_loading_message();
+                                bool runtime_ready_flag = Overlay::is_runtime_ready();
+                                bool loader_active = !(runtime_ready_flag && stage == Overlay::LoadingStage::Ready);
+                                if (!loader_active)
+                                    g_loader_capture_requested = false;
+
                                 ImGuiIO &io = ImGui::GetIO();
-                                io.MouseDrawCursor = menu_visible;
 
                                 static bool insert_prev_down = false;
                                 bool insert_down = (GetAsyncKeyState(VK_INSERT) & 0x8000) != 0;
-                                if (insert_down && !insert_prev_down)
+                                if (loader_active)
+                                {
+                                    if (!menu_visible)
+                                    {
+                                        menu_visible = true;
+                                        showMenu = true;
+                                        evo::theme::menu_open = true;
+                                    }
+                                }
+                                else if (insert_down && !insert_prev_down)
                                 {
                                     menu_visible = !menu_visible;
                                     showMenu = menu_visible;
                                     evo::theme::menu_open = menu_visible;
                                     if (!menu_visible)
                                         evo::reset_all_popups();
-                                    updateInputPassthrough();
                                 }
                                 insert_prev_down = insert_down;
 
-                                if (menu_visible != evo::theme::menu_open)
+                                if (!loader_active && menu_visible != evo::theme::menu_open)
                                 {
                                     menu_visible = evo::theme::menu_open;
                                     showMenu = menu_visible;
                                     if (!menu_visible)
                                         evo::reset_all_popups();
-                                    updateInputPassthrough();
                                 }
+
+                                bool loader_capture = loader_active && g_loader_capture_requested;
+                                updateInputPassthrough((menu_visible && !loader_active) || loader_capture);
+
+                                io.MouseDrawCursor = menu_visible;
 
                                 static std::array<bool, 256> key_state{};
                                 auto &manager = modules::ModuleManager::get_instance();
@@ -1842,9 +2234,11 @@ namespace cradle
                                     key_state[key] = down;
                                 }
 
-                                bool runtime_ready_flag = Overlay::is_runtime_ready();
-
-                                if (runtime_ready_flag)
+                                if (loader_active)
+                                {
+                                    RenderLoadingOverlay(stage, loading_text);
+                                }
+                                else
                                 {
                                     cradle::engine::PlayerCache::update_cache();
                                     TickMovementOverrides();
@@ -1873,12 +2267,6 @@ namespace cradle
                                     }
 
                                     cradle::config::ConfigManager::tick(manager);
-                                }
-                                else
-                                {
-                                    auto stage = Overlay::get_loading_stage();
-                                    auto loading_text = Overlay::get_loading_message();
-                                    RenderLoadingOverlay(stage, loading_text);
                                 }
 
                                 auto render_start = std::chrono::high_resolution_clock::now();

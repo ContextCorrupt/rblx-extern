@@ -250,6 +250,10 @@ evo::vec2_t evo::child_t::get_position( ) {
 	return this->base_window;
 }
 
+float evo::child_t::get_content_height( ) const {
+	return this->base_size.y - 42.f;
+}
+
 /* set group visible */
 void evo::child_t::set_visible( bool visible ) { 
 	this->base_visible = visible;
@@ -563,8 +567,9 @@ void evo::child_t::obj( text_t* text ) {
 		text->paint( );
 
 		/* update element spacing */
-		this->base_element.y[ this->child_id ] += 35;
-		slide_offset[ this->child_id ] += 35;
+		const float consumed_height = text->get_consumed_height( );
+		this->base_element.y[ this->child_id ] += consumed_height;
+		slide_offset[ this->child_id ] += consumed_height;
 
 		/* assign to this object a new index */
 		_container->set_id( _container->get_id( ) + 1 );
@@ -762,8 +767,8 @@ void evo::child_t::make_colorpicker( evo::col_t* color, float* hue ) {
 	this->obj( new colorpicker_t( color, hue ) );
 }
 
-void evo::child_t::make_text( std::string label ) {
-	this->obj( new text_t( label ) );
+void evo::child_t::make_text( std::string label, float min_height ) {
+	this->obj( new text_t( label, min_height ) );
 }
 
 void evo::child_t::make_textbox( std::string label, std::string* value ) {

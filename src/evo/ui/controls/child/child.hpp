@@ -49,6 +49,7 @@ namespace evo {
 	public: /* positions */
 		void set_position( evo::vec2_t position );
 		evo::vec2_t get_position( );
+		float get_content_height( ) const;
 	public: /* visible */
 		void set_visible( bool visible );
 		bool get_visible( );
@@ -82,7 +83,7 @@ namespace evo {
 		void make_slider_int( std::string label, int* value, int min, int max, std::string suffix = "" );
 		void make_dropdown( std::string label, int* value, std::vector<std::string> items );
 		void make_colorpicker( evo::col_t* color, float* hue );
-		void make_text( std::string label );
+		void make_text( std::string label, float min_height = 35.f );
 		void make_textbox( std::string label, std::string* value );
 		void make_listbox( std::string label, int* value, std::vector<std::string>& items, std::string& filter );
 		void make_multibox( std::string label, std::vector<evo::multi_dropdown_system> items );

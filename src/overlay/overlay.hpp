@@ -68,7 +68,7 @@ namespace cradle
             void createRenderTarget();
             void cleanupRenderTarget();
             void updateWindowPosition();
-            void updateInputPassthrough();
+            void updateInputPassthrough(bool capture_input);
         };
 
         

@@ -1,5 +1,6 @@
 #include "profiling_module.hpp"
 
+#include <windows.h>
 #include <imgui.h>
 #include <cstdio>
 
@@ -7,6 +8,29 @@
 
 namespace cradle::modules
 {
+    namespace
+    {
+        void ApplyConsoleVisibility(bool visible)
+        {
+            static HWND console_window = nullptr;
+            static bool cached_state = true;
+            static bool initialized = false;
+
+            if (!console_window || !IsWindow(console_window))
+                console_window = GetConsoleWindow();
+
+            if (!console_window)
+                return;
+
+            if (!initialized || cached_state != visible)
+            {
+                ShowWindow(console_window, visible ? SW_SHOW : SW_HIDE);
+                cached_state = visible;
+                initialized = true;
+            }
+        }
+    }
+
     ProfilingModule::ProfilingModule()
         : Module("profiling", "diagnostic overlay controls")
     {
@@ -14,11 +38,19 @@ namespace cradle::modules
         settings.push_back(Setting("show esp cache profiler", false));
         settings.push_back(Setting("show player cache profiler", false));
         settings.push_back(Setting("show draw profiler", false));
-    settings.push_back(Setting("show module profiler", false));
+        settings.push_back(Setting("show module profiler", false));
+        settings.push_back(Setting("show console window", false));
     }
 
     void ProfilingModule::on_render()
     {
+        auto console_setting = get_setting("show console window");
+        const bool show_console = !console_setting || console_setting->value.bool_val;
+        ApplyConsoleVisibility(show_console);
+
+        if (!is_enabled())
+            return;
+
         auto esp_setting = get_setting("show esp cache profiler");
         auto player_setting = get_setting("show player cache profiler");
         auto draw_setting = get_setting("show draw profiler");
@@ -96,5 +128,10 @@ namespace cradle::modules
                           snapshot.module_render_peak_ms);
             draw_list->AddText(viewport->Pos + ImVec2(32.0f, y_offset), IM_COL32(255, 120, 180, 230), buffer);
         }
+    }
+
+    bool ProfilingModule::allow_render_when_disabled()
+    {
+        return true;
     }
 }
