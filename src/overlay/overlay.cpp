@@ -162,6 +162,13 @@ namespace cradle
             constexpr double kGravityEnforceInterval = 0.05;
             constexpr float kDefaultGravity = 196.2f;
             constexpr double kLightingEnforceInterval = 0.05;
+            constexpr float kLightingMaxFogDistance = 100000.0f;
+            constexpr float kLightingClockMin = 0.0f;
+            constexpr float kLightingClockMax = 24.0f;
+            constexpr float kLightingLatitudeMin = -90.0f;
+            constexpr float kLightingLatitudeMax = 90.0f;
+            constexpr float kLightingExposureMin = -8.0f;
+            constexpr float kLightingExposureMax = 8.0f;
 
             struct GravityOverrideState
             {
@@ -185,13 +192,25 @@ namespace cradle
                 cradle::engine::vector3 color_shift_bottom{0.0f, 0.0f, 0.0f};
                 cradle::engine::vector3 color_shift_top{0.0f, 0.0f, 0.0f};
                 cradle::engine::vector3 fog_color{0.753f, 0.753f, 0.753f};
+                cradle::engine::vector3 outdoor_ambient{0.0f, 0.0f, 0.0f};
                 float brightness = 4.6f;
+                float fog_start = 0.0f;
+                float fog_end = 1000.0f;
+                float exposure_compensation = 0.0f;
+                float clock_time = 12.0f;
+                float geographic_latitude = 41.733f;
 
                 cradle::engine::vector3 default_ambient{0.157f, 0.129f, 0.184f};
                 cradle::engine::vector3 default_color_shift_bottom{0.0f, 0.0f, 0.0f};
                 cradle::engine::vector3 default_color_shift_top{0.0f, 0.0f, 0.0f};
                 cradle::engine::vector3 default_fog_color{0.753f, 0.753f, 0.753f};
+                cradle::engine::vector3 default_outdoor_ambient{0.0f, 0.0f, 0.0f};
                 float default_brightness = 4.6f;
+                float default_fog_start = 0.0f;
+                float default_fog_end = 1000.0f;
+                float default_exposure_compensation = 0.0f;
+                float default_clock_time = 12.0f;
+                float default_geographic_latitude = 41.733f;
 
                 bool defaults_initialized = false;
                 bool lighting_ready = false;
@@ -206,7 +225,29 @@ namespace cradle
                 float color_shift_bottom_hue = 0.0f;
                 float color_shift_top_hue = 0.0f;
                 float fog_color_hue = 0.0f;
+                float outdoor_ambient_hue = 0.0f;
+
+                bool pending_apply = false;
             };
+
+            static bool nearly_equal(float a, float b, float eps);
+
+            bool LightingVectorChanged(const cradle::engine::vector3 &before, const cradle::engine::vector3 &after)
+            {
+                return !nearly_equal(before.X, after.X, 0.0005f) ||
+                       !nearly_equal(before.Y, after.Y, 0.0005f) ||
+                       !nearly_equal(before.Z, after.Z, 0.0005f);
+            }
+
+            bool LightingFloatChanged(float before, float after, float epsilon = 0.0005f)
+            {
+                return !nearly_equal(before, after, epsilon);
+            }
+
+            void MarkLightingPendingApply(LightingOverrideState &state)
+            {
+                state.pending_apply = true;
+            }
 
             LightingOverrideState g_lighting_override_state;
 
@@ -493,6 +534,26 @@ namespace cradle
                 return cradle::memory::write<float>(lighting.address + Offsets::Lighting::Brightness, clamped);
             }
 
+            bool TryReadLightingFloat(const cradle::engine::Instance &lighting, uintptr_t offset, float &value_out)
+            {
+                if (!lighting.is_valid())
+                    return false;
+
+                float value = cradle::memory::read<float>(lighting.address + offset);
+                if (!std::isfinite(value))
+                    return false;
+
+                value_out = value;
+                return true;
+            }
+
+            bool TryWriteLightingFloat(const cradle::engine::Instance &lighting, uintptr_t offset, float value)
+            {
+                if (!lighting.is_valid() || !std::isfinite(value))
+                    return false;
+                return cradle::memory::write<float>(lighting.address + offset, value);
+            }
+
             void EnsureLightingDefaults(LightingOverrideState &state, const cradle::engine::Instance &lighting)
             {
                 if (state.last_lighting_address != lighting.address)
@@ -508,14 +569,26 @@ namespace cradle
                 cradle::engine::vector3 cs_bottom{};
                 cradle::engine::vector3 cs_top{};
                 cradle::engine::vector3 fog{};
+                cradle::engine::vector3 outdoor{};
                 float brightness = 0.0f;
+                float fog_start = 0.0f;
+                float fog_end = 0.0f;
+                float exposure = 0.0f;
+                float clock_time = 0.0f;
+                float latitude = 0.0f;
 
                 bool ok = true;
                 ok &= TryReadLightingColor(lighting, Offsets::Lighting::Ambient, ambient);
                 ok &= TryReadLightingColor(lighting, Offsets::Lighting::ColorShift_Bottom, cs_bottom);
                 ok &= TryReadLightingColor(lighting, Offsets::Lighting::ColorShift_Top, cs_top);
                 ok &= TryReadLightingColor(lighting, Offsets::Lighting::FogColor, fog);
+                ok &= TryReadLightingColor(lighting, Offsets::Lighting::OutdoorAmbient, outdoor);
                 ok &= TryReadLightingBrightness(lighting, brightness);
+                ok &= TryReadLightingFloat(lighting, Offsets::Lighting::FogStart, fog_start);
+                ok &= TryReadLightingFloat(lighting, Offsets::Lighting::FogEnd, fog_end);
+                ok &= TryReadLightingFloat(lighting, Offsets::Lighting::ExposureCompensation, exposure);
+                ok &= TryReadLightingFloat(lighting, Offsets::Lighting::ClockTime, clock_time);
+                ok &= TryReadLightingFloat(lighting, Offsets::Lighting::GeographicLatitude, latitude);
 
                 if (!ok)
                     return;
@@ -524,13 +597,26 @@ namespace cradle
                 state.default_color_shift_bottom = ClampLightingColor(cs_bottom);
                 state.default_color_shift_top = ClampLightingColor(cs_top);
                 state.default_fog_color = ClampLightingColor(fog);
+                state.default_outdoor_ambient = ClampLightingColor(outdoor);
                 state.default_brightness = std::clamp(brightness, 0.0f, 10.0f);
+                state.default_fog_start = std::clamp(fog_start, 0.0f, kLightingMaxFogDistance);
+                float fog_end_clamped = std::clamp(fog_end, 0.0f, kLightingMaxFogDistance);
+                state.default_fog_end = std::max(fog_end_clamped, state.default_fog_start + 0.1f);
+                state.default_exposure_compensation = std::clamp(exposure, kLightingExposureMin, kLightingExposureMax);
+                state.default_clock_time = std::clamp(clock_time, kLightingClockMin, kLightingClockMax);
+                state.default_geographic_latitude = std::clamp(latitude, kLightingLatitudeMin, kLightingLatitudeMax);
 
                 state.ambient = state.default_ambient;
                 state.color_shift_bottom = state.default_color_shift_bottom;
                 state.color_shift_top = state.default_color_shift_top;
                 state.fog_color = state.default_fog_color;
                 state.brightness = state.default_brightness;
+                state.outdoor_ambient = state.default_outdoor_ambient;
+                state.fog_start = state.default_fog_start;
+                state.fog_end = state.default_fog_end;
+                state.exposure_compensation = state.default_exposure_compensation;
+                state.clock_time = state.default_clock_time;
+                state.geographic_latitude = state.default_geographic_latitude;
 
                 state.defaults_initialized = true;
             }
@@ -544,14 +630,26 @@ namespace cradle
                 state.color_shift_bottom = ClampLightingColor(state.color_shift_bottom);
                 state.color_shift_top = ClampLightingColor(state.color_shift_top);
                 state.fog_color = ClampLightingColor(state.fog_color);
+                state.outdoor_ambient = ClampLightingColor(state.outdoor_ambient);
                 state.brightness = std::clamp(state.brightness, 0.0f, 10.0f);
+                state.fog_start = std::clamp(state.fog_start, 0.0f, kLightingMaxFogDistance);
+                state.fog_end = std::clamp(state.fog_end, state.fog_start + 0.1f, kLightingMaxFogDistance);
+                state.exposure_compensation = std::clamp(state.exposure_compensation, kLightingExposureMin, kLightingExposureMax);
+                state.clock_time = std::clamp(state.clock_time, kLightingClockMin, kLightingClockMax);
+                state.geographic_latitude = std::clamp(state.geographic_latitude, kLightingLatitudeMin, kLightingLatitudeMax);
 
                 bool ok = true;
                 ok &= TryWriteLightingColor(lighting, Offsets::Lighting::Ambient, state.ambient);
                 ok &= TryWriteLightingColor(lighting, Offsets::Lighting::ColorShift_Bottom, state.color_shift_bottom);
                 ok &= TryWriteLightingColor(lighting, Offsets::Lighting::ColorShift_Top, state.color_shift_top);
                 ok &= TryWriteLightingColor(lighting, Offsets::Lighting::FogColor, state.fog_color);
+                ok &= TryWriteLightingColor(lighting, Offsets::Lighting::OutdoorAmbient, state.outdoor_ambient);
                 ok &= TryWriteLightingBrightness(lighting, state.brightness);
+                ok &= TryWriteLightingFloat(lighting, Offsets::Lighting::FogStart, state.fog_start);
+                ok &= TryWriteLightingFloat(lighting, Offsets::Lighting::FogEnd, state.fog_end);
+                ok &= TryWriteLightingFloat(lighting, Offsets::Lighting::ExposureCompensation, state.exposure_compensation);
+                ok &= TryWriteLightingFloat(lighting, Offsets::Lighting::ClockTime, state.clock_time);
+                ok &= TryWriteLightingFloat(lighting, Offsets::Lighting::GeographicLatitude, state.geographic_latitude);
 
                 state.last_apply_time = static_cast<float>(ImGui::GetTime());
                 state.last_apply_success = ok;
@@ -576,7 +674,8 @@ namespace cradle
                 EnsureLightingDefaults(state, lighting);
 
                 double now = ImGui::GetTime();
-                bool enforce = state.lock_lighting || state.enforce_after_apply;
+                bool needs_apply = state.pending_apply;
+                bool enforce = state.lock_lighting || state.enforce_after_apply || needs_apply;
                 if (!enforce)
                     return;
 
@@ -585,10 +684,18 @@ namespace cradle
 
                 bool applied = ApplyLightingOverrides(state, lighting);
                 state.last_enforce_time = now;
-                state.enforce_after_apply = state.lock_lighting;
 
-                if (!applied && !state.lock_lighting)
-                    state.enforce_after_apply = false;
+                if (applied && needs_apply)
+                    state.pending_apply = false;
+
+                if (applied)
+                {
+                    state.enforce_after_apply = state.lock_lighting;
+                }
+                else
+                {
+                    state.enforce_after_apply = state.lock_lighting || state.pending_apply;
+                }
             }
 
 [[maybe_unused]] const char *GetKeyName(int vk)
@@ -763,7 +870,7 @@ namespace cradle
                                         entries.push_back({"Walkspeed override", nullptr, MemoryPanelSection::Walkspeed});
                                         entries.push_back({"Jump height override", nullptr, MemoryPanelSection::JumpHeight});
                                         entries.push_back({"Gravity override", nullptr, MemoryPanelSection::Gravity});
-                                        entries.push_back({"Lighting overrides", nullptr, MemoryPanelSection::Lighting});
+                                        entries.push_back({"Lighting reference overrides", nullptr, MemoryPanelSection::Lighting});
                                     }
 
                                     for (auto *mod : modules)
@@ -2086,20 +2193,25 @@ namespace cradle
                                 void RenderLightingColorPicker(evo::child_t *child,
                                                               const char *label,
                                                               cradle::engine::vector3 &value,
-                                                              float &hue_cache)
+                                                              float &hue_cache,
+                                                              LightingOverrideState &state)
                                 {
+                                    cradle::engine::vector3 before = value;
                                     evo::col_t color = Color3ToEvoColor(value);
                                     if (hue_cache <= 0.0f)
                                         hue_cache = color.hue();
                                     child->make_text(label);
                                     child->make_colorpicker(&color, &hue_cache);
                                     value = ClampLightingColor(EvoColorToColor3(color));
+                                    if (LightingVectorChanged(before, value))
+                                        MarkLightingPendingApply(state);
                                 }
 
                                 void RenderLightingMemorySection(evo::child_t *child)
                                 {
                                     auto &state = g_lighting_override_state;
-                                    child->make_text("Lighting overrides");
+                                    child->make_text("Lighting reference overrides");
+                                    child->make_text("Based on lr/lighting_reference.txt offsets (Ambient, OutdoorAmbient, Fog, Time).");
 
                                     auto dm_instance = cradle::engine::DataModel::get_instance();
                                     auto lighting = dm_instance.find_first_child_of_class("Lighting");
@@ -2116,23 +2228,73 @@ namespace cradle
 
                                     EnsureLightingDefaults(state, lighting);
 
-                                    RenderLightingColorPicker(child, "ambient##lighting", state.ambient, state.ambient_hue);
-                                    RenderLightingColorPicker(child, "color shift (top)##lighting", state.color_shift_top, state.color_shift_top_hue);
-                                    RenderLightingColorPicker(child, "color shift (bottom)##lighting", state.color_shift_bottom, state.color_shift_bottom_hue);
-                                    RenderLightingColorPicker(child, "fog color##lighting", state.fog_color, state.fog_color_hue);
+                                    RenderLightingColorPicker(child, "ambient##lighting", state.ambient, state.ambient_hue, state);
+                                    RenderLightingColorPicker(child, "color shift (top)##lighting", state.color_shift_top, state.color_shift_top_hue, state);
+                                    RenderLightingColorPicker(child, "color shift (bottom)##lighting", state.color_shift_bottom, state.color_shift_bottom_hue, state);
+                                    RenderLightingColorPicker(child, "fog color##lighting", state.fog_color, state.fog_color_hue, state);
+                                    RenderLightingColorPicker(child, "outdoor ambient##lighting", state.outdoor_ambient, state.outdoor_ambient_hue, state);
 
                                     state.brightness = std::clamp(state.brightness, 0.0f, 10.0f);
+                                    float prev_brightness = state.brightness;
                                     child->make_slider_float("brightness##lighting", &state.brightness, 0.0f, 10.0f, "");
+                                    if (LightingFloatChanged(prev_brightness, state.brightness))
+                                        MarkLightingPendingApply(state);
+
+                                    float prev_exposure = state.exposure_compensation;
+                                    child->make_slider_float("exposure compensation##lighting", &state.exposure_compensation,
+                                                             kLightingExposureMin, kLightingExposureMax, "");
+                                    if (LightingFloatChanged(prev_exposure, state.exposure_compensation))
+                                        MarkLightingPendingApply(state);
+
+                                    float prev_fog_start = state.fog_start;
+                                    child->make_slider_float("fog start##lighting", &state.fog_start, 0.0f, kLightingMaxFogDistance, "");
+                                    if (LightingFloatChanged(prev_fog_start, state.fog_start, 0.01f))
+                                        MarkLightingPendingApply(state);
+
+                                    float prev_fog_end = state.fog_end;
+                                    child->make_slider_float("fog end##lighting", &state.fog_end, 0.0f, kLightingMaxFogDistance, "");
+                                    if (LightingFloatChanged(prev_fog_end, state.fog_end, 0.01f))
+                                        MarkLightingPendingApply(state);
+
+                                    float prev_clock = state.clock_time;
+                                    child->make_slider_float("clock time##lighting", &state.clock_time,
+                                                             kLightingClockMin, kLightingClockMax, "");
+                                    if (LightingFloatChanged(prev_clock, state.clock_time, 0.001f))
+                                        MarkLightingPendingApply(state);
+
+                                    float prev_lat = state.geographic_latitude;
+                                    child->make_slider_float("geographic latitude##lighting", &state.geographic_latitude,
+                                                             kLightingLatitudeMin, kLightingLatitudeMax, "");
+                                    if (LightingFloatChanged(prev_lat, state.geographic_latitude, 0.001f))
+                                        MarkLightingPendingApply(state);
                                     child->make_checkbox("lock lighting overrides", &state.lock_lighting);
 
                                     cradle::engine::vector3 live_ambient;
+                                    cradle::engine::vector3 live_outdoor;
                                     float live_brightness = 0.0f;
+                                    float live_fog_start = 0.0f;
+                                    float live_fog_end = 0.0f;
+                                    float live_exposure = 0.0f;
+                                    float live_clock = 0.0f;
+                                    float live_latitude = 0.0f;
                                     if (TryReadLightingColor(lighting, Offsets::Lighting::Ambient, live_ambient) &&
-                                        TryReadLightingBrightness(lighting, live_brightness))
+                                        TryReadLightingColor(lighting, Offsets::Lighting::OutdoorAmbient, live_outdoor) &&
+                                        TryReadLightingBrightness(lighting, live_brightness) &&
+                                        TryReadLightingFloat(lighting, Offsets::Lighting::FogStart, live_fog_start) &&
+                                        TryReadLightingFloat(lighting, Offsets::Lighting::FogEnd, live_fog_end) &&
+                                        TryReadLightingFloat(lighting, Offsets::Lighting::ExposureCompensation, live_exposure) &&
+                                        TryReadLightingFloat(lighting, Offsets::Lighting::ClockTime, live_clock) &&
+                                        TryReadLightingFloat(lighting, Offsets::Lighting::GeographicLatitude, live_latitude))
                                     {
-                                        char live_buf[160];
-                                        std::snprintf(live_buf, sizeof(live_buf), "current ambient %.3f/%.3f/%.3f · brightness %.2f",
-                                                      live_ambient.X, live_ambient.Y, live_ambient.Z, live_brightness);
+                                        char live_buf[192];
+                                        std::snprintf(live_buf, sizeof(live_buf),
+                                                      "ambient %.3f/%.3f/%.3f · outdoor %.3f/%.3f/%.3f",
+                                                      live_ambient.X, live_ambient.Y, live_ambient.Z,
+                                                      live_outdoor.X, live_outdoor.Y, live_outdoor.Z);
+                                        child->make_text(live_buf);
+                                        std::snprintf(live_buf, sizeof(live_buf),
+                                                      "brightness %.2f · exposure %.2f · fog %.1f-%.1f · clock %.2f · lat %.2f",
+                                                      live_brightness, live_exposure, live_fog_start, live_fog_end, live_clock, live_latitude);
                                         child->make_text(live_buf);
                                     }
 
@@ -2140,7 +2302,10 @@ namespace cradle
                                         bool applied = ApplyLightingOverrides(state, lighting);
                                         state.enforce_after_apply = applied;
                                         if (applied)
+                                        {
                                             state.last_enforce_time = ImGui::GetTime();
+                                            state.pending_apply = false;
+                                        }
                                     });
 
                                     if (state.defaults_initialized)
@@ -2150,20 +2315,41 @@ namespace cradle
                                             state.color_shift_bottom = state.default_color_shift_bottom;
                                             state.color_shift_top = state.default_color_shift_top;
                                             state.fog_color = state.default_fog_color;
+                                            state.outdoor_ambient = state.default_outdoor_ambient;
                                             state.brightness = state.default_brightness;
+                                            state.fog_start = state.default_fog_start;
+                                            state.fog_end = state.default_fog_end;
+                                            state.exposure_compensation = state.default_exposure_compensation;
+                                            state.clock_time = state.default_clock_time;
+                                            state.geographic_latitude = state.default_geographic_latitude;
                                             bool applied = ApplyLightingOverrides(state, lighting);
                                             state.enforce_after_apply = applied;
                                             if (applied)
+                                            {
                                                 state.last_enforce_time = ImGui::GetTime();
+                                                state.pending_apply = false;
+                                            }
                                         });
 
-                                        char defaults_buffer[196];
+                                        char defaults_buffer[256];
                                         std::snprintf(defaults_buffer, sizeof(defaults_buffer),
-                                                      "defaults · ambient %.3f/%.3f/%.3f · brightness %.2f",
+                                                      "defaults · ambient %.3f/%.3f/%.3f · outdoor %.3f/%.3f/%.3f",
                                                       state.default_ambient.X,
                                                       state.default_ambient.Y,
                                                       state.default_ambient.Z,
-                                                      state.default_brightness);
+                                                      state.default_outdoor_ambient.X,
+                                                      state.default_outdoor_ambient.Y,
+                                                      state.default_outdoor_ambient.Z);
+                                        child->make_text(defaults_buffer);
+
+                                        std::snprintf(defaults_buffer, sizeof(defaults_buffer),
+                                                      "brightness %.2f · exposure %.2f · fog %.1f-%.1f · clock %.2f · lat %.2f",
+                                                      state.default_brightness,
+                                                      state.default_exposure_compensation,
+                                                      state.default_fog_start,
+                                                      state.default_fog_end,
+                                                      state.default_clock_time,
+                                                      state.default_geographic_latitude);
                                         child->make_text(defaults_buffer);
                                     }
 
@@ -2182,7 +2368,7 @@ namespace cradle
                                         }
                                     }
 
-                                    child->make_text("values clamp to RGB 0-1; divide 0-255 colors by 255");
+                                    child->make_text("colors clamp to 0-1; fog/time/latitude limits follow Roblox Lighting constraints");
                                 }
 
                                 void RenderMemoryPanel(evo::child_t *child, MemoryPanelSection section)
