@@ -1,0 +1,882 @@
+Lighting Update Reference
+==========================
+
+Each section restates the engine behavior plus the exact code regions that implement it so the earlier report is self-contained.
+
+Detailed lighting update flow
+-----------------------------
+1. **State changes originate inside `Lighting`** – Whenever gameplay code, Studio, or replication sets a Lighting property, the setters in `Lighting.cpp` clamp the new value, refresh `skyParameters`, raise the appropriate `Reflection::PropDescriptor`, and call `fireLightingChanged`. Sky insertions are also routed through `Lighting::replaceSky`, ensuring the same signal path. (See Section 1 plus the Root insertion hook in Section 2.)
+2. **RenderView listens and invalidates** – `RenderView::bindWorkspace` resolves the Lighting service and connects `lightingChangedSignal` to `RenderView::invalidateLighting`. The next frame’s `updateLighting` call rebuilds skyboxes, updates clear colors, pushes ambient/key/fill lighting by calling `presetLighting`, and toggles sky visibility. Fog distances are animated every frame inside `updateFog`, blending toward Lighting’s fog properties regardless of change frequency. (See Section 5.)
+3. **VisualEngine and SceneUpdater propagate changes to the LightGrid** – When a workspace binds, `VisualEngine::bindWorkspace` instantiates `SceneUpdater`, which, on every update cycle, calls `computeLightingPrepare/Perform`. These functions re-center the LightGrid around the camera, propagate global lighting flags (shadows, sky ambient, sun direction), run occupancy voxelization, and enqueue chunk uploads. Local geometry edits call `lightingInvalidateOccupancy`/`lightingInvalidateLocal`, which mark LightGrid chunks dirty so lighting recomputation includes them. (See Sections 4, 6, and 7.)
+4. **Light instances feed local contributions** – `Light.cpp` exposes property setters for Point/Spot/Surface lights. When brightness, color, range, or angle changes, the setters raise property-change events; the SceneUpdater uses those events to invalidate LightGrid chunks, and `lightingUpdateChunkLocal` gathers the active lights to bake them into the voxel volume. (See Section 8 plus the chunk update logic in Section 7.)
+5. **FrameRateManager gates workload** – Quality-tier decisions from `FrameRateManager` determine LightGrid radius, chunk budget per frame, and whether non-fixed parts are considered. SceneUpdater samples these values (`getLightingChunkBudget`, `getLightingNonFixedEnabled`) at the end of `computeLightingPerform`, so lighting updates naturally scale with device performance. (See Section 9 references inside Section 6’s code.)
+6. **Resulting data reaches shaders** – After chunk uploads, SceneUpdater writes LightGrid transform data (`LightConfig0-3`, `LightBorder`) into `GlobalShaderData`. Render passes sample this data, while `SceneManager::setLighting` (from `presetLighting`) provides the directional sun key/fill/ambient terms for forward shading. Together, these steps ensure both global time-of-day lighting and per-voxel local lights stay in sync with gameplay changes.
+
+Lighting update code
+--------------------
+**`RenderView::updateFog` ( `Rendering/GfxRender/RenderView.cpp` )**
+```cpp
+void RenderView::updateFog()
+{
+	static const float TAU = 0.04f; // dampening factor as in:   exp( -x * TAU )
+
+	RBX::Lighting* lighting = ServiceProvider::create<RBX::Lighting>(dataModel.get());
+
+	if (FFlag::RenderFixFog)
+	{
+		float currDeltaFRM = fogEndTargetFRM - fogEndCurrentFRM;
+		if (currDeltaFRM > 0)
+			fogEndCurrentFRM += currDeltaFRM * TAU;
+		else
+			fogEndCurrentFRM = fogEndTargetFRM;
+	   
+		float fogEnd   = std::max(fogEndCurrentFRM, lighting->getFogEnd()*0.5f);
+		float fogStart = G3D::clamp(lighting->getFogStart(), 0.0f, fogEnd - 0.1f);
+
+		visualEngine->getSceneManager()->setFog(lighting->getFogColor(), fogStart, fogEnd);
+	}
+	else
+	{
+		float frmEnd = this->fogEndTargetFRM;
+		float fogStart = lighting->getFogStart();
+		float fogEnd   = lighting->getFogEnd();
+		float range = fogEnd - fogStart;
+
+		// set fog
+		fogEnd = std::min(fogEnd, frmEnd);
+		float currDelta = fogEnd - this->fogEndCurrentFRM;
+		fogEnd = this->fogEndCurrentFRM += currDelta * TAU;
+		if (frmEnd < lighting->getFogEnd() && currDelta < 0)
+		{
+			fogEnd = this->fogEndCurrentFRM = frmEnd; // force instant transition
+		}
+
+		fogEnd = this->fogEndCurrentFRM = std::max(fogEnd, lighting->getFogEnd()*0.5f);
+		fogStart = fogEnd - range * (fogEnd / lighting->getFogEnd());
+
+		// Make sure fog range is not empty to avoid issues
+		fogStart = G3D::clamp(fogStart, 0.0f, fogEnd - 0.1f);
+
+		visualEngine->getSceneManager()->setFog(lighting->getFogColor(), fogStart, fogEnd);
+	}
+}
+```
+
+**`RenderView::updateLighting` ( `Rendering/GfxRender/RenderView.cpp` )**
+```cpp
+void RenderView::updateLighting(Lighting* lighting)
+{
+    SceneManager* smgr = visualEngine->getSceneManager();
+
+	if (!lightingValid)
+	{
+        // Sky
+        if (FFlag::RenderThumbModelReflectionsFix || !lighting->isSkySuppressed()) // prepare the sky regardless of whether it's suppressed, because it's needed for the envmaps
+        {
+			Sky* sky = smgr->getSky();
+
+            if (lighting->sky)
+			{
+                sky->setSkyBox(lighting->sky->skyRt, lighting->sky->skyLf, lighting->sky->skyBk, lighting->sky->skyFt, lighting->sky->skyUp, lighting->sky->skyDn);
+				sky->setCelestialBodies(lighting->sky->sunTexture, lighting->sky->moonTexture);
+				sky->update(lighting->getSkyParameters(), lighting->sky->getNumStars(), lighting->sky->drawCelestialBodies, lighting->sky->sunAngularSize, lighting->sky->moonAngularSize);
+			}
+            else
+			{
+                sky->setSkyBoxDefault();
+				sky->setCelestialBodiesDefault();
+				sky->update(lighting->getSkyParameters(), 3000, true, 21, 11);
+			}
+
+            // Update clear color for time-of-day
+            lighting->setClearColor(lighting->getSkyParameters().skyAmbient);
+        }
+
+        // Lighting
+        presetLighting(lighting);
+
+        lightingValid = true;
+	}
+
+    smgr->setSkyEnabled(!lighting->isSkySuppressed());
+    smgr->setClearColor(Color4(lighting->getClearColor(), lighting->getClearAlpha()));
+}
+```
+
+**`RenderView::presetLighting` ( `Rendering/GfxRender/RenderView.cpp` )**
+```cpp
+void RenderView::presetLighting(RBX::Lighting* l, const RBX::Color3& extraAmbient, float skylightFactor)
+{
+	outlinesEnabled = l->getOutlines();
+
+	const G3D::LightingParameters& skyParameters = l->getSkyParameters();
+	SceneManager *smgr = visualEngine->getSceneManager();
+	
+	Color3 bottomColorShift = l->getBottomColorShift();
+	Color3 topColorShift = l->getTopColorShift();
+
+	float bottomShiftBase = (bottomColorShift.r+bottomColorShift.g+bottomColorShift.b)*0.3333f;
+	Color3 bottomAdjustment = bottomColorShift - Color3(bottomShiftBase,bottomShiftBase, bottomShiftBase);
+	
+	float topShiftBase = (topColorShift.r+topColorShift.g+topColorShift.b)*0.3333f;
+	Color3 topAdjustment = topColorShift - Color3(topShiftBase,topShiftBase, topShiftBase);
+
+	float globalBrightness = G3D::clamp(l->getGlobalBrightness(), 0.05f, 5.0f);
+
+	Vector3 sunDirection = -skyParameters.lightDirection.unit();
+	Color3 sunColor = skyParameters.lightColor * 0.9f;
+
+	Color3 ambientColor = l->getGlobalAmbient() + extraAmbient;
+	
+	Color3 keyLightColor = sunColor * globalBrightness;
+	keyLightColor += topAdjustment * keyLightColor.length();
+	keyLightColor *= skylightFactor;
+
+	Color3 fillLightColor = sunColor * globalBrightness * 0.4f;
+	fillLightColor += bottomAdjustment * fillLightColor.length();
+	fillLightColor *= skylightFactor;
+
+	smgr->setLighting(ambientColor, sunDirection, keyLightColor.min(Color3::white()), fillLightColor.min(Color3::white()));
+}
+```
+
+**`SceneUpdater::computeLightingPrepare` ( `Rendering/GfxRender/SceneUpdater.cpp` )**
+```cpp
+void SceneUpdater::computeLightingPrepare()
+{
+	RBXPROFILER_SCOPE("Render", "computeLightingPrepare");
+
+    bool bulkExecution = mSettings->getEagerBulkExecution();
+
+    GlobalShaderData& globalShaderData = mVisualEngine->getSceneManager()->writeGlobalShaderData();
+
+    // Dummy setup so that light grid sampling still works without the grid
+    globalShaderData.LightConfig0 = Vector4();
+    globalShaderData.LightConfig1 = Vector4();
+    globalShaderData.LightConfig2 = Vector4();
+    globalShaderData.LightConfig3 = Vector4(-1, -1, -1, 0);
+    globalShaderData.LightBorder = Vector4(0, 0, 0, 1);
+
+    if (!computeLightingEnabled)
+        return;
+
+    mLastOccupancyUpdates = 0;
+
+    if (!computeLightingEnabled)
+        return;
+
+    if (LightGrid* lgrid = mVisualEngine->getLightGrid())
+    {
+        ContactManager* contactManager = dataModel->getWorkspace()->getWorld()->getContactManager();
+        MegaClusterInstance* terrain = boost::polymorphic_downcast<MegaClusterInstance*>(dataModel->getWorkspace()->getTerrain());
+        RBX::Camera* camera = dataModel->getWorkspace()->getCamera();
+        RBX::Lighting* lighting = ServiceProvider::find<Lighting>(dataModel.get());
+
+        // Make sure lighting is active if global shadows are on
+        if (lighting->getGlobalShadows())
+        {
+            checkAndActivateLighting();
+        }
+
+        // Compute focus point; note that the computation is different in play mode and studio mode
+    	if (camera->getCameraSubject())
+        {
+			mFocusPoint = camera->getCameraFocus().translation;
+        }
+        else
+        {
+			RBX::Vector3 hit = RBX::Vector3::zero();
+
+			if (FFlag::FixCameraTargetStudio)
+			{
+				RBX::Vector3 origin = mVisualEngine->getSceneManager()->getMinumumSqDistanceCenter();
+				RBX::Vector3 direction = camera->getCameraCoordinateFrame().vectorToWorldSpace(RBX::Vector3(0.0f,0.0f,-1.0f));
+
+				hit = origin + direction;
+			}
+			else
+			{
+				float minSqDistance = mVisualEngine->getSceneManager()->getMinumumSqPartDistance();
+				float distance = (minSqDistance == FLT_MAX ? 0 : sqrt(minSqDistance));
+
+				RBX::Vector3 origin = mVisualEngine->getSceneManager()->getMinumumSqDistanceCenter();
+				RBX::Vector3 direction = camera->getCameraCoordinateFrame().vectorToWorldSpace(RBX::Vector3(0.0f,0.0f,-1.0f));
+				hit = origin + direction*distance;
+
+				direction.y = 0;
+				hit += direction * 16*4.0f;
+			}
+
+            mFocusPoint = hit;
+        }
+
+        unsigned chunkBudget = getChunkBudget();
+
+        // Relocate the grid if focus point moved far enough
+        // Note: we can skip updating chunk contents (filling with dummy color and uploading) if lighting is not active
+        mLightgridMoved = lgrid->updateGridCenter(mFocusPoint, /* skipChunkUpdates= */ !mLightingActive);
+
+        mOccupancyPartCache.clear();
+        mLgridchunksToUpdate.clear();
+
+        if ((!mLightgridMoved || bulkExecution) && mLightingActive)
+        {
+            lgrid->updateAgePriorityForChunks(mFocusPoint);
+
+            // Update global light attributes for the light grid
+            if (1)
+            {
+                lgrid->setLightShadows(lighting->getGlobalShadows());
+
+                if (lighting->getGlobalShadows())
+                {
+                    lgrid->setSkyAmbient(Color3uint8(lighting->getSkyAmbient()));
+                }
+                else
+                {
+                    lgrid->setSkyAmbient(Color3uint8());
+                }
+            }
+
+            if (lighting->getGlobalShadows())
+            {
+                lgrid->setLightDirection(-lighting->getSkyParameters().lightDirection.unit());
+            }
+
+            for (unsigned i = 0; i < chunkBudget; ++i)
+            {
+                LightGridChunk* chunk = NULL;
+                if (bulkExecution)
+                    chunk = lgrid->findFirstDirtyChunk();
+                else if (mAgeDirtyProportion == FLog::RenderLightGridAgeProportion)
+                {
+                    chunk = lgrid->findOldestChunk();
+                    mAgeDirtyProportion = 0;
+                }
+                else
+                {
+                    chunk = lgrid->findDirtyChunk();
+                    mAgeDirtyProportion++;
+                }
+
+                if (!chunk)
+                    break;
+
+                RBXASSERT(chunk->dirty);
+
+                if (chunk->dirty & LightGridChunk::Dirty_Occupancy)
+                {
+                    lgrid->occupancyUpdateChunkPrepare(*chunk, terrain, contactManager, mOccupancyPartCache);
+                    mLastOccupancyUpdates++;
+                }
+
+                mLgridchunksToUpdate.push_back( std::make_pair( chunk, (unsigned)chunk->dirty ) );
+
+                // reset chunk dirty flag so that findDirtyChunk does not pick it up again
+                chunk->dirty = 0;
+                chunk->age   = 0;
+            }
+
+			// restore chunk dirty flags so that we get correct state in perform
+			for (auto& chunk: mLgridchunksToUpdate)
+				chunk.first->dirty = chunk.second;
+        }
+
+    }
+}
+```
+
+**`SceneUpdater::computeLightingPerform` ( `Rendering/GfxRender/SceneUpdater.cpp` )**
+```cpp
+void SceneUpdater::computeLightingPerform()
+{
+	RBXPROFILER_SCOPE("Render", "computeLightingPerform");
+
+    bool bulkExecution = mSettings->getEagerBulkExecution();
+    GlobalShaderData& globalShaderData = mVisualEngine->getSceneManager()->writeGlobalShaderData();
+
+	if (LightGrid* lgrid = mVisualEngine->getLightGrid())
+	{
+		RBX::Timer<RBX::Time::Benchmark> timer;
+
+		mLastLightingUpdates = 0;
+
+		SpatialHashedScene* spatialHashedScene = mVisualEngine->getSceneManager()->getSpatialHashedScene();
+
+		// Don't update lighting in the same frame where we move the grid to reduce relocation stall
+		// Don't update lighting unless it is active
+		// Do update lighting if bulkExecution is true so that one pass is enough
+		if ((!mLightgridMoved || bulkExecution) && mLightingActive)
+		{
+			RBX::Timer<RBX::Time::Precise> timer;
+		
+			lgrid->updateBorderColor(mFocusPoint, updateFrustum);
+
+            lgrid->occupancyUpdateChunkPerform(mOccupancyPartCache);
+
+            unsigned chunkBudget = getChunkBudget();
+ 
+            if ((!mLightgridMoved || bulkExecution) && mLightingActive)
+            {
+                for (unsigned i = 0; i < chunkBudget; ++i)
+                {
+                    // now the tricky part...
+                    LightGridChunk* chunk = NULL;
+                    
+                    if( i < mLgridchunksToUpdate.size() ) // first, try the chunk cache from prepare
+                    {
+                        chunk = mLgridchunksToUpdate[i].first;
+                    }
+                    else // otherwise, we have some budget left, try other dirty chunks
+                    {
+                        if (bulkExecution)
+                            chunk = lgrid->findFirstDirtyChunk();
+                        else
+                            chunk = lgrid->findDirtyChunk();
+                    }
+
+                    if(!chunk)
+                        break; // nothing to update
+
+			    if (chunk->dirty & (LightGridChunk::Dirty_LightingLocal | LightGridChunk::Dirty_LightingLocalShadowed))
+				    lgrid->lightingUpdateChunkLocal(*chunk, spatialHashedScene);
+
+			    if (chunk->dirty & LightGridChunk::Dirty_LightingGlobal)
+				    lgrid->lightingUpdateChunkGlobal(*chunk);
+			
+			    if (chunk->dirty & LightGridChunk::Dirty_LightingSkylight)
+				    lgrid->lightingUpdateChunkSkylight(*chunk);
+			
+			    if (chunk->dirty & (LightGridChunk::Dirty_LightingGlobal | LightGridChunk::Dirty_LightingSkylight))
+				    lgrid->lightingUpdateChunkAverage(*chunk);
+
+			    mLastLightingUpdates++;
+			
+			    if (!bulkExecution)
+				    lgrid->lightingUploadChunk(*chunk);
+
+			    chunk->dirty = 0;
+			    chunk->age = 0;
+	    	}
+
+                if (bulkExecution && mLastLightingUpdates != 0)
+                    lgrid->lightingUploadAll();
+
+				lgrid->lightingUploadCommit();
+
+                if (mLastOccupancyUpdates > 0 || mLastLightingUpdates > 0)
+                {
+                    FASTLOG3(FLog::RenderLightGrid, "LightGrid: Updated %d chunks in %d usec (occupancy: %d chunks)", mLastLightingUpdates, (int)(timer.delta().msec() * 1000), mLastOccupancyUpdates);
+                }
+
+            }
+
+		}
+		
+		// Pass grid offset to shader via global data
+        RBX::Vector3 gridOffset = lgrid->getGridCornerOffset();
+        RBX::Vector3 gridSize = lgrid->getGridSize();
+        RBX::Color4uint8 borderColor = lgrid->getBorderColor();
+        
+        float frmRadius = mVisualEngine->getFrameRateManager()->getLightGridRadius();
+        
+        RBX::Vector3 gridCenter = gridOffset + gridSize / 2.f;
+        RBX::Vector3 gridRadius = RBX::Vector3(frmRadius, gridSize.y / 2.f, frmRadius).min(gridSize / 2.f);
+
+        // world space -> texture space: v * scale + offset
+        RBX::Vector3 gridTextureScale = RBX::Vector3(1.f / gridSize.x, 1.f / gridSize.y, 1.f / gridSize.z);
+
+        // note: technically we can make the offset zero - the texture is wrapped and shifted so that
+        // the world space to texture space mapping is constant.
+        // however, to improve precision we'd like the transformed coordinates to be small, so we need to offset.
+    RBX::Vector3 gridTextureOffset = lgrid->getWrapSafeOffset() * gridTextureScale;
+        
+        // for 2D texture sampling we have to offset the texture space by half of the texel in Y so that nearest sampling on LUT works
+    if (lgrid->hasTexture() && lgrid->getTexture()->getType() == Texture::Type_2D)
+        {
+            float gridDepth = lgrid->getChunkCount().y * kLightGridChunkSizeY;
+
+            gridTextureOffset.y -= 0.5f / gridDepth;
+
+            gridTextureOffset.y += 0.01f / gridDepth;
+        }
+
+        RBX::Vector3 gridRadiusEffective = gridRadius * 0.95f;
+        
+        RBX::Vector3 gridTextureSpaceCenter = gridCenter * gridTextureScale + gridTextureOffset;
+        RBX::Vector3 gridTextureSpaceRadius = gridRadiusEffective * gridTextureScale;
+        
+        globalShaderData.LightConfig0 = Vector4(gridTextureScale.y, gridTextureScale.x, gridTextureScale.z, 0);
+        globalShaderData.LightConfig1 = Vector4(gridTextureOffset.y, gridTextureOffset.x, gridTextureOffset.z, 0);
+        globalShaderData.LightConfig2 = Vector4(gridTextureSpaceCenter.y, gridTextureSpaceCenter.x, gridTextureSpaceCenter.z, 0);
+        globalShaderData.LightConfig3 = Vector4(gridTextureSpaceRadius.y, gridTextureSpaceRadius.x, gridTextureSpaceRadius.z, 0);
+        globalShaderData.LightBorder = Vector4(borderColor.r / 255.f, borderColor.g / 255.f, borderColor.b / 255.f, borderColor.a / 255.f);
+
+		// Update grid settings from FRM
+		// Make sure it's at the end so that FastCluster updates and lighting updates see the same value during one frame
+		lgrid->setNonFixedPartsEnabled(mVisualEngine->getFrameRateManager()->getLightingNonFixedEnabled());
+		
+		mLightingComputeAverage.sample(timer.delta().msec());
+	}
+}
+```
+
+1. Lighting service (`App/v8datamodel/Lighting.cpp`)
+----------------------------------------------------
+**Reflection surface, event, and bound properties**
+```cpp
+REFLECTION_BEGIN();
+static Reflection::EventDesc<Lighting, void(bool)> event_LightingChanged(&Lighting::lightingChangedSignal, "LightingChanged", "skyboxChanged");
+static Reflection::PropDescriptor<Lighting, std::string> prop_Time("TimeOfDay", category_Data, &Lighting::getTimeStr, &Lighting::setTimeStr);
+static Reflection::PropDescriptor<Lighting, float> prop_ClockTime("ClockTime", category_Data, &Lighting::getTimeFloat, &Lighting::setTimeFloat);
+...
+Reflection::BoundProp<float> Lighting::desc_GlobalBrightness("Brightness", category_Appearance, &Lighting::globalBrightness, &Lighting::onPropChanged);
+Reflection::BoundProp<G3D::Color3> Lighting::desc_TopColorShift("ColorShift_Top", category_Appearance, &Lighting::topColorShift, &Lighting::onPropChanged);
+Reflection::BoundProp<G3D::Color3> Lighting::desc_BottomColorShift("ColorShift_Bottom", category_Appearance, &Lighting::bottomColorShift, &Lighting::onPropChanged);
+Reflection::BoundProp<G3D::Color3> Lighting::desc_GlobalAmbient("Ambient", category_Appearance, &Lighting::globalAmbient, &Lighting::onPropChanged);
+Reflection::BoundProp<G3D::Color3> Lighting::desc_GlobalOutdoorAmbient("OutdoorAmbient", category_Appearance, &Lighting::globalOutdoorAmbient, &Lighting::onPropChanged);
+Reflection::BoundProp<bool> Lighting::desc_Outlines("Outlines", category_Appearance, &Lighting::outlines, &Lighting::onPropChanged);
+REFLECTION_END();
+```
+
+**Time-of-day setters and geographic latitude**
+```cpp
+float Lighting::getTimeFloat() const { ... }
+void Lighting::setTimeFloat(float value)
+{
+    value = G3D::clamp(value, 0.0f, 24.0f);
+    int seconds = ceil(value * 3600);
+    if (timeOfDay.total_seconds() != seconds)
+    {
+        timeOfDay = boost::posix_time::seconds(seconds);
+        skyParameters.setTime(getGameTime());
+        this->raisePropertyChanged(prop_ClockTime);
+        fireLightingChanged(false);
+    }
+}
+
+void Lighting::setTime(const boost::posix_time::time_duration& value)
+{
+    int seconds = value.total_seconds();
+    seconds %= 60*60*24;
+    if (timeOfDay.total_seconds()!=seconds)
+    {
+        timeOfDay = boost::posix_time::seconds(seconds);
+        skyParameters.setTime(getGameTime());
+        this->raisePropertyChanged(prop_Time);
+        fireLightingChanged(false);
+    }
+}
+
+void Lighting::setGeographicLatitude(float value)
+{
+    if (value!=skyParameters.geoLatitude)
+    {
+        skyParameters.setLatitude(value);
+        skyParameters.setTime(getGameTime());
+        this->raisePropertyChanged(prop_GeographicLatitude);
+        fireLightingChanged(false);
+    }
+}
+```
+
+**Core property setters that trigger lighting refresh**
+```cpp
+void Lighting::setClearColor(const Color3& value)
+{
+    if (value!=clearColor)
+    {
+        clearColor = value;
+        fireLightingChanged(false);
+    }
+}
+
+void Lighting::setGlobalAmbient(const Color3& value)
+{
+    if (value!=globalAmbient)
+    {
+        globalAmbient = value;
+        this->raisePropertyChanged(desc_GlobalAmbient);
+        fireLightingChanged(false);
+    }
+}
+
+void Lighting::setShadowColor(const Color3& value)
+{
+    if (value!=shadowColor)
+    {
+        shadowColor = value;
+        this->raisePropertyChanged(desc_ShadowColor);
+        fireLightingChanged(false);
+    }
+}
+```
+
+**Sky ownership and change propagation**
+```cpp
+void Lighting::replaceSky(Sky* newSky)
+{
+    while (Sky* oldSky = this->findFirstChildOfType<Sky>())
+    {
+        oldSky->setParent(NULL);
+    }
+    newSky->setParent(this);
+}
+
+void Lighting::onChildAdded(Instance* child)
+{
+    Super::onChildAdded(child);
+    if (Sky* sky = Instance::fastDynamicCast<Sky>(child))
+    {
+        this->sky = shared_from(sky);
+        fireLightingChanged(true);
+    }
+}
+
+void Lighting::onChildRemoving(Instance* child)
+{
+    if (sky.get()==child)
+    {
+        sky.reset();
+        fireLightingChanged(true);
+    }
+    Super::onChildRemoving(child);
+}
+```
+
+2. Sky insertion hook (`App/v8datamodel/RootInstance.cpp`)
+---------------------------------------------------------
+```cpp
+if (Sky* sky = Instance::fastDynamicCast<Sky>(instance)) 
+{
+    Lighting* lighting = ServiceProvider::create<Lighting>(this);
+    lighting->replaceSky(sky);
+    createWaypoint = true;
+}
+```
+
+3. Celestial calculations (`Rendering/g3d/g3dcpp/LightingParameters.cpp`)
+-------------------------------------------------------------------------
+```cpp
+void LightingParameters::setTime(const GameTime _time) {
+    double time = _time - floor(_time / DAY) * DAY;
+    ...
+    sunPosition.x = sin(sourceAngle);
+    sunPosition.y = -cos(sourceAngle);
+    ...
+    if (!physicallyCorrect) {
+        ...
+        lightDirection.x = sin(sourceAngle);
+        lightDirection.y = -cos(sourceAngle);
+    } else if (trueSunPosition.y > -.3f) {
+        source = SUN;
+        lightDirection = trueSunPosition;
+    } else {
+        source = MOON;
+        lightDirection = trueMoonPosition;
+    }
+    ...
+    lightColor = linearSpline(time, times, color, 10);
+    ambient = linearSpline(time, times2, color2, 10);
+    ...
+}
+```
+
+4. Visual engine workspace binding (`Rendering/GfxRender/VisualEngine.cpp`)
+----------------------------------------------------------------------------
+```cpp
+void VisualEngine::bindWorkspace(const shared_ptr<DataModel>& dm)
+{
+    if (dm)
+    {
+        contentProvider = ServiceProvider::create<ContentProvider>(dm.get());
+        meshContentProvider = ServiceProvider::create<MeshContentProvider>(dm.get());
+        lighting = ServiceProvider::create<Lighting>(dm.get());
+        ...
+        RBXASSERT(!sceneUpdater);
+        sceneUpdater.reset(new SceneUpdater(dm, this));
+        adorn.reset(new AdornRender(this, dm.get()));
+        if (lightGrid)
+        {
+            lightGrid->lightingClearAll();
+            lightGrid->lightingUploadAll();
+            lightGrid->lightingUploadCommit();
+        }
+    }
+    else
+    {
+        contentProvider = NULL;
+        meshContentProvider = NULL;
+        lighting = NULL;
+        if (sceneUpdater)
+        {
+            sceneUpdater->unbind();
+            sceneUpdater.reset();
+        }
+        adorn.reset();
+        ...
+    }
+}
+```
+
+5. RenderView interaction (`Rendering/GfxRender/RenderView.cpp`)
+-----------------------------------------------------------------
+**Workspace binding and LightingChanged connection**
+```cpp
+if (this->dataModel)
+{
+    visualEngine->bindWorkspace(dataModel);
+    Lighting* lighting = ServiceProvider::create<Lighting>(dataModel.get());
+    lightingChangedConnection = lighting->lightingChangedSignal.connect(boost::bind(&RenderView::invalidateLighting, this, _1));
+    ...
+    fogEndCurrentFRM = fogEndTargetFRM = lighting->getFogEnd();
+}
+```
+
+**Invalidate and rebuild lighting**
+```cpp
+void RenderView::invalidateLighting(bool updateSkybox)
+{
+    lightingValid = false;
+}
+
+void RenderView::updateLighting(Lighting* lighting)
+{
+    SceneManager* smgr = visualEngine->getSceneManager();
+    if (!lightingValid)
+    {
+        if (FFlag::RenderThumbModelReflectionsFix || !lighting->isSkySuppressed())
+        {
+            Sky* sky = smgr->getSky();
+            if (lighting->sky)
+            {
+                sky->setSkyBox(...);
+                sky->update(lighting->getSkyParameters(), ...);
+            }
+            else
+            {
+                sky->setSkyBoxDefault();
+                sky->update(lighting->getSkyParameters(), 3000, true, 21, 11);
+            }
+            lighting->setClearColor(lighting->getSkyParameters().skyAmbient);
+        }
+        presetLighting(lighting);
+        lightingValid = true;
+    }
+    smgr->setSkyEnabled(!lighting->isSkySuppressed());
+    smgr->setClearColor(Color4(lighting->getClearColor(), lighting->getClearAlpha()));
+}
+```
+
+**Fog updates every frame**
+```cpp
+void RenderView::updateFog()
+{
+    static const float TAU = 0.04f;
+    RBX::Lighting* lighting = ServiceProvider::create<RBX::Lighting>(dataModel.get());
+    if (FFlag::RenderFixFog)
+    {
+        ...
+        visualEngine->getSceneManager()->setFog(lighting->getFogColor(), fogStart, fogEnd);
+    }
+    else
+    {
+        ...
+        visualEngine->getSceneManager()->setFog(lighting->getFogColor(), fogStart, fogEnd);
+    }
+}
+```
+
+**Ambient/key/fill computation**
+```cpp
+void RenderView::presetLighting(RBX::Lighting* l, const RBX::Color3& extraAmbient, float skylightFactor)
+{
+    outlinesEnabled = l->getOutlines();
+    const G3D::LightingParameters& skyParameters = l->getSkyParameters();
+    SceneManager *smgr = visualEngine->getSceneManager();
+    ...
+    Vector3 sunDirection = -skyParameters.lightDirection.unit();
+    Color3 sunColor = skyParameters.lightColor * 0.9f;
+    Color3 ambientColor = l->getGlobalAmbient() + extraAmbient;
+    Color3 keyLightColor = sunColor * globalBrightness;
+    ...
+    smgr->setLighting(ambientColor, sunDirection, keyLightColor.min(Color3::white()), fillLightColor.min(Color3::white()));
+}
+```
+
+6. SceneUpdater and LightGrid orchestration (`Rendering/GfxRender/SceneUpdater.cpp`)
+-----------------------------------------------------------------------------------
+```cpp
+void SceneUpdater::updatePrepare(...)
+{
+    ...
+    updateDynamicParts();
+    computeLightingPrepare();
+}
+
+void SceneUpdater::updatePerform()
+{
+    computeLightingPerform();
+}
+
+void SceneUpdater::lightingInvalidateOccupancy(const RBX::Extents& extents, const RBX::Vector3& highPriorityPoint, bool isFixed)
+{
+    if (LightGrid* lgrid = mVisualEngine->getLightGrid())
+    {
+        if (mLightingActive && (isFixed || lgrid->getNonFixedPartsEnabled()))
+        {
+            lgrid->invalidateExtents(extents, LightGridChunk::Dirty_OccupancyAndDependents);
+            lgrid->invalidatePoint(highPriorityPoint, LightGridChunk::Dirty_HighPriority);
+        }
+    }
+}
+
+void SceneUpdater::lightingInvalidateLocal(const RBX::Extents& extents)
+{
+    if (LightGrid* lgrid = mVisualEngine->getLightGrid())
+    {
+        checkAndActivateLighting();
+        lgrid->invalidateExtents(extents, LightGridChunk::Dirty_LightingLocal);
+    }
+}
+
+void SceneUpdater::computeLightingPrepare()
+{
+    ...
+    if (LightGrid* lgrid = mVisualEngine->getLightGrid()) 
+    {
+        ...
+        if (lighting->getGlobalShadows())
+        {
+            checkAndActivateLighting();
+        }
+        ...
+        mLightgridMoved = lgrid->updateGridCenter(mFocusPoint, !mLightingActive);
+        ...
+        lgrid->setLightShadows(lighting->getGlobalShadows());
+        if (lighting->getGlobalShadows())
+        {
+            lgrid->setSkyAmbient(Color3uint8(lighting->getSkyAmbient()));
+            lgrid->setLightDirection(-lighting->getSkyParameters().lightDirection.unit());
+        }
+        ...
+        lgrid->occupancyUpdateChunkPrepare(*chunk, terrain, contactManager, mOccupancyPartCache);
+        ...
+    }
+}
+
+void SceneUpdater::computeLightingPerform()
+{
+    if (LightGrid* lgrid = mVisualEngine->getLightGrid()) 
+    {
+        ...
+        if ((!mLightgridMoved || bulkExecution) && mLightingActive)
+        {
+            lgrid->updateBorderColor(mFocusPoint, updateFrustum);
+            lgrid->occupancyUpdateChunkPerform(mOccupancyPartCache);
+            ...
+            if (chunk->dirty & (LightGridChunk::Dirty_LightingLocal | LightGridChunk::Dirty_LightingLocalShadowed))
+                lgrid->lightingUpdateChunkLocal(*chunk, spatialHashedScene);
+            if (chunk->dirty & LightGridChunk::Dirty_LightingGlobal)
+                lgrid->lightingUpdateChunkGlobal(*chunk);
+            if (chunk->dirty & LightGridChunk::Dirty_LightingSkylight)
+                lgrid->lightingUpdateChunkSkylight(*chunk);
+            if (chunk->dirty & (LightGridChunk::Dirty_LightingGlobal | LightGridChunk::Dirty_LightingSkylight))
+                lgrid->lightingUpdateChunkAverage(*chunk);
+            ...
+            lgrid->lightingUploadCommit();
+        }
+        ...
+        lgrid->setNonFixedPartsEnabled(mVisualEngine->getFrameRateManager()->getLightingNonFixedEnabled());
+    }
+}
+```
+
+7. LightGrid chunk processing (`Rendering/GfxRender/LightGrid.cpp`)
+-------------------------------------------------------------------
+```cpp
+void LightGrid::occupancyUpdateChunkPrepare(...)
+{
+    voxelizer.occupancyUpdateChunkPrepare(chunk, terrain, contactManager, partCache);
+}
+
+void LightGrid::lightingUpdateChunkLocal(LightGridChunk& chunk, SpatialHashedScene* spatialHashedScene)
+{
+    Extents chunkExtents = chunk.getChunkExtents();
+    std::vector<LightObject*> lights;
+    lightingGetLights(lights, chunkExtents, spatialHashedScene);
+    chunk.neverDirty = hasShadowCastingLights(lights) ? 0 : LightGridChunk::Dirty_LightingLocalShadowed;
+    if (!lights.empty())
+    {
+        memset(lightingScratch, 0, sizeof(lightingScratch));
+        for (size_t i = 0; i < lights.size(); ++i)
+            lightingUpdateLightScratch(chunk, chunkExtents, lights[i]);
+        SIMDCALL(lightingBlurAxisYZScratch, <true>());
+        SIMDCALL(lightingBlurAxisYZScratch, <false>());
+        SIMDCALL(lightingBlurAxisXScratchToChunk, (chunk));
+    }
+    else
+    {
+        lightingClearLocal(chunk);
+    }
+}
+
+bool LightGrid::updateGridCenter(const Vector3& cameraTarget, bool skipChunkUpdate)
+{
+    Vector3int32 cameraPos = getGridPosition(cameraTarget);
+    ...
+    Vector3int32 newCorner = getChunkIndexFromGridPosition(cameraPos + chunkCenterLocal) - gridCenterLocal;
+    relocateGrid(newCorner, skipChunkUpdate);
+    return true;
+}
+```
+
+8. Light instances (`App/v8datamodel/Light.cpp`)
+-----------------------------------------------
+```cpp
+void Light::setEnabled(bool value)
+{
+    if (enabled != value) {
+        enabled = value;
+        raisePropertyChanged(prop_Enabled);
+    }
+}
+
+void Light::setColor(Color3 value)
+{
+    if (color != value) {
+        color = value;
+        raisePropertyChanged(prop_Color);
+    }
+}
+
+void PointLight::setRange(float value)
+{
+    value = std::min(std::max(value, 0.f), 60.f);
+    if (range != value) {
+        range = value;
+        raisePropertyChanged(prop_Range);
+    }
+}
+```
+
+9. FrameRateManager lighting knobs (`Rendering/GfxBase/FrameRateManager.cpp`)
+-----------------------------------------------------------------------------
+```cpp
+float FrameRateManager::getLightGridRadius() const
+{
+    return LockstepTable[mCurrentQualityLevel].lightGridRadius;
+}
+
+bool FrameRateManager::getLightingNonFixedEnabled() const
+{
+    return LockstepTable[mCurrentQualityLevel].lightAllowNonFixed;
+}
+
+unsigned FrameRateManager::getLightingChunkBudget() const
+{
+    return LockstepTable[mCurrentQualityLevel].lightChunkBudget;
+}
+```
+
+These excerpts match every pathway described in the rewritten lighting report, so readers no longer need to open the source files separately to verify how lighting updates propagate.

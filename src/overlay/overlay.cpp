@@ -1058,6 +1058,20 @@ namespace cradle
                                                 if (before != setting.value.int_val)
                                                     cradle::config::ConfigManager::mark_dirty();
                                             }
+                                            else if (is_anti_aim && setting.name == "spinbot mode")
+                                            {
+                                                static const std::vector<std::string> kSpinbotModes = {
+                                                    "Smooth spin",
+                                                    "Jitter flip",
+                                                    "Position pulse"
+                                                };
+                                                int before = setting.value.int_val;
+                                                if (setting.value.int_val < setting.range.int_range.min || setting.value.int_val > setting.range.int_range.max)
+                                                    setting.value.int_val = setting.range.int_range.min;
+                                                child->make_dropdown("spinbot mode", &setting.value.int_val, kSpinbotModes);
+                                                if (before != setting.value.int_val)
+                                                    cradle::config::ConfigManager::mark_dirty();
+                                            }
                                             else
                                             {
                                                 int before = setting.value.int_val;
