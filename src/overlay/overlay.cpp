@@ -41,6 +41,7 @@ extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd, UINT msg
 #include "../cache/player_cache.hpp"
 #include "../modules/module_manager.hpp"
 #include "../modules/friend_manager.hpp"
+#include "../modules/anti_aim/anti_aim_module.hpp"
 #include "../config/config_manager.hpp"
 #include "../util/memory/memory.hpp"
 #include "../evo/inc.hpp"
@@ -80,7 +81,8 @@ namespace cradle
                 None = -1,
                 Walkspeed = 0,
                 JumpHeight,
-                Gravity
+                Gravity,
+                Lighting
             };
 
             struct ModuleListEntry
@@ -159,6 +161,7 @@ namespace cradle
 
             constexpr double kGravityEnforceInterval = 0.05;
             constexpr float kDefaultGravity = 196.2f;
+            constexpr double kLightingEnforceInterval = 0.05;
 
             struct GravityOverrideState
             {
@@ -175,6 +178,37 @@ namespace cradle
             };
 
             GravityOverrideState g_gravity_override_state;
+
+            struct LightingOverrideState
+            {
+                cradle::engine::vector3 ambient{0.157f, 0.129f, 0.184f};
+                cradle::engine::vector3 color_shift_bottom{0.0f, 0.0f, 0.0f};
+                cradle::engine::vector3 color_shift_top{0.0f, 0.0f, 0.0f};
+                cradle::engine::vector3 fog_color{0.753f, 0.753f, 0.753f};
+                float brightness = 4.6f;
+
+                cradle::engine::vector3 default_ambient{0.157f, 0.129f, 0.184f};
+                cradle::engine::vector3 default_color_shift_bottom{0.0f, 0.0f, 0.0f};
+                cradle::engine::vector3 default_color_shift_top{0.0f, 0.0f, 0.0f};
+                cradle::engine::vector3 default_fog_color{0.753f, 0.753f, 0.753f};
+                float default_brightness = 4.6f;
+
+                bool defaults_initialized = false;
+                bool lighting_ready = false;
+                bool last_apply_success = false;
+                float last_apply_time = 0.0f;
+                uintptr_t last_lighting_address = 0;
+                bool lock_lighting = false;
+                bool enforce_after_apply = false;
+                double last_enforce_time = 0.0;
+
+                float ambient_hue = 0.0f;
+                float color_shift_bottom_hue = 0.0f;
+                float color_shift_top_hue = 0.0f;
+                float fog_color_hue = 0.0f;
+            };
+
+            LightingOverrideState g_lighting_override_state;
 
             static bool nearly_equal(float a, float b, float eps)
             {
@@ -384,6 +418,179 @@ namespace cradle
                 }
             }
 
+            cradle::engine::vector3 ClampLightingColor(const cradle::engine::vector3 &color)
+            {
+                return cradle::engine::vector3(
+                    std::clamp(color.X, 0.0f, 1.0f),
+                    std::clamp(color.Y, 0.0f, 1.0f),
+                    std::clamp(color.Z, 0.0f, 1.0f));
+            }
+
+            bool IsFiniteColor(const cradle::engine::vector3 &color)
+            {
+                return std::isfinite(color.X) && std::isfinite(color.Y) && std::isfinite(color.Z);
+            }
+
+            evo::col_t Color3ToEvoColor(const cradle::engine::vector3 &color)
+            {
+                return evo::col_t(
+                    static_cast<int>(std::clamp(color.X, 0.0f, 1.0f) * 255.0f),
+                    static_cast<int>(std::clamp(color.Y, 0.0f, 1.0f) * 255.0f),
+                    static_cast<int>(std::clamp(color.Z, 0.0f, 1.0f) * 255.0f),
+                    255);
+            }
+
+            cradle::engine::vector3 EvoColorToColor3(const evo::col_t &color)
+            {
+                return cradle::engine::vector3(
+                    color.r / 255.0f,
+                    color.g / 255.0f,
+                    color.b / 255.0f);
+            }
+
+            bool TryReadLightingColor(const cradle::engine::Instance &lighting, uintptr_t offset, cradle::engine::vector3 &color)
+            {
+                if (!lighting.is_valid())
+                    return false;
+
+                auto value = cradle::memory::read<cradle::engine::vector3>(lighting.address + offset);
+                if (!IsFiniteColor(value))
+                    return false;
+
+                color = ClampLightingColor(value);
+                return true;
+            }
+
+            bool TryWriteLightingColor(const cradle::engine::Instance &lighting, uintptr_t offset, cradle::engine::vector3 color)
+            {
+                if (!lighting.is_valid())
+                    return false;
+
+                if (!IsFiniteColor(color))
+                    return false;
+
+                auto clamped = ClampLightingColor(color);
+                return cradle::memory::write<cradle::engine::vector3>(lighting.address + offset, clamped);
+            }
+
+            bool TryReadLightingBrightness(const cradle::engine::Instance &lighting, float &brightness)
+            {
+                if (!lighting.is_valid())
+                    return false;
+
+                float value = cradle::memory::read<float>(lighting.address + Offsets::Lighting::Brightness);
+                if (!std::isfinite(value))
+                    return false;
+                brightness = value;
+                return true;
+            }
+
+            bool TryWriteLightingBrightness(const cradle::engine::Instance &lighting, float brightness)
+            {
+                if (!lighting.is_valid() || !std::isfinite(brightness))
+                    return false;
+                float clamped = std::clamp(brightness, 0.0f, 10.0f);
+                return cradle::memory::write<float>(lighting.address + Offsets::Lighting::Brightness, clamped);
+            }
+
+            void EnsureLightingDefaults(LightingOverrideState &state, const cradle::engine::Instance &lighting)
+            {
+                if (state.last_lighting_address != lighting.address)
+                {
+                    state.defaults_initialized = false;
+                    state.last_lighting_address = lighting.address;
+                }
+
+                if (state.defaults_initialized)
+                    return;
+
+                cradle::engine::vector3 ambient{};
+                cradle::engine::vector3 cs_bottom{};
+                cradle::engine::vector3 cs_top{};
+                cradle::engine::vector3 fog{};
+                float brightness = 0.0f;
+
+                bool ok = true;
+                ok &= TryReadLightingColor(lighting, Offsets::Lighting::Ambient, ambient);
+                ok &= TryReadLightingColor(lighting, Offsets::Lighting::ColorShift_Bottom, cs_bottom);
+                ok &= TryReadLightingColor(lighting, Offsets::Lighting::ColorShift_Top, cs_top);
+                ok &= TryReadLightingColor(lighting, Offsets::Lighting::FogColor, fog);
+                ok &= TryReadLightingBrightness(lighting, brightness);
+
+                if (!ok)
+                    return;
+
+                state.default_ambient = ClampLightingColor(ambient);
+                state.default_color_shift_bottom = ClampLightingColor(cs_bottom);
+                state.default_color_shift_top = ClampLightingColor(cs_top);
+                state.default_fog_color = ClampLightingColor(fog);
+                state.default_brightness = std::clamp(brightness, 0.0f, 10.0f);
+
+                state.ambient = state.default_ambient;
+                state.color_shift_bottom = state.default_color_shift_bottom;
+                state.color_shift_top = state.default_color_shift_top;
+                state.fog_color = state.default_fog_color;
+                state.brightness = state.default_brightness;
+
+                state.defaults_initialized = true;
+            }
+
+            bool ApplyLightingOverrides(LightingOverrideState &state, const cradle::engine::Instance &lighting)
+            {
+                if (!lighting.is_valid())
+                    return false;
+
+                state.ambient = ClampLightingColor(state.ambient);
+                state.color_shift_bottom = ClampLightingColor(state.color_shift_bottom);
+                state.color_shift_top = ClampLightingColor(state.color_shift_top);
+                state.fog_color = ClampLightingColor(state.fog_color);
+                state.brightness = std::clamp(state.brightness, 0.0f, 10.0f);
+
+                bool ok = true;
+                ok &= TryWriteLightingColor(lighting, Offsets::Lighting::Ambient, state.ambient);
+                ok &= TryWriteLightingColor(lighting, Offsets::Lighting::ColorShift_Bottom, state.color_shift_bottom);
+                ok &= TryWriteLightingColor(lighting, Offsets::Lighting::ColorShift_Top, state.color_shift_top);
+                ok &= TryWriteLightingColor(lighting, Offsets::Lighting::FogColor, state.fog_color);
+                ok &= TryWriteLightingBrightness(lighting, state.brightness);
+
+                state.last_apply_time = static_cast<float>(ImGui::GetTime());
+                state.last_apply_success = ok;
+                return ok;
+            }
+
+            void TickLightingOverrides()
+            {
+                auto &state = g_lighting_override_state;
+                auto dm_instance = cradle::engine::DataModel::get_instance();
+                auto lighting = dm_instance.find_first_child_of_class("Lighting");
+
+                state.lighting_ready = lighting.is_valid();
+                if (!state.lighting_ready)
+                {
+                    state.defaults_initialized = false;
+                    state.enforce_after_apply = false;
+                    state.last_lighting_address = 0;
+                    return;
+                }
+
+                EnsureLightingDefaults(state, lighting);
+
+                double now = ImGui::GetTime();
+                bool enforce = state.lock_lighting || state.enforce_after_apply;
+                if (!enforce)
+                    return;
+
+                if ((now - state.last_enforce_time) < kLightingEnforceInterval)
+                    return;
+
+                bool applied = ApplyLightingOverrides(state, lighting);
+                state.last_enforce_time = now;
+                state.enforce_after_apply = state.lock_lighting;
+
+                if (!applied && !state.lock_lighting)
+                    state.enforce_after_apply = false;
+            }
+
 [[maybe_unused]] const char *GetKeyName(int vk)
                                 {
                                     static char name[64];
@@ -505,11 +712,13 @@ namespace cradle
                                 void RenderWalkspeedMemorySection(evo::child_t *child);
                                 void RenderJumpHeightMemorySection(evo::child_t *child);
                                 void RenderGravityMemorySection(evo::child_t *child);
+                                void RenderLightingMemorySection(evo::child_t *child);
                                 void RenderVisualColorPanel(evo::child_t *child);
                                 void RenderProfilingPanel(evo::child_t *child, cradle::modules::Module *module);
                                 void RenderConfigTab(evo::window_t *window);
                                 void RenderTabContents(evo::window_t *window, EvoTab tab);
                                 void RenderCheatIndicator();
+                                void TickLightingOverrides();
 
                                 void RenderEvoMenuWindow(Overlay &overlay)
                                 {
@@ -554,6 +763,7 @@ namespace cradle
                                         entries.push_back({"Walkspeed override", nullptr, MemoryPanelSection::Walkspeed});
                                         entries.push_back({"Jump height override", nullptr, MemoryPanelSection::JumpHeight});
                                         entries.push_back({"Gravity override", nullptr, MemoryPanelSection::Gravity});
+                                        entries.push_back({"Lighting overrides", nullptr, MemoryPanelSection::Lighting});
                                     }
 
                                     for (auto *mod : modules)
@@ -641,6 +851,7 @@ namespace cradle
 
                                     const bool is_esp = module->get_name() == "esp";
                                     const bool is_aimbot = module->get_name() == "aimbot";
+                                    const bool is_anti_aim = module->get_name() == "anti aim";
                                     const bool is_friends = module->get_name() == "friends";
                                     const bool is_visual_colors = module->get_name() == "visual colors";
                                     const bool is_profiling = module->get_name() == "profiling";
@@ -705,6 +916,23 @@ namespace cradle
                                     if (is_aimbot)
                                     {
                                         child->make_text("Aimbot runs only while its keybind is active.");
+                                    }
+
+                                    if (is_anti_aim)
+                                    {
+                                        if (auto *anti_module = dynamic_cast<cradle::modules::AntiAimModule *>(module))
+                                        {
+                                            int desync_key_code = anti_module->get_desync_hotkey();
+                                            int desync_key_mode = DefaultUiSelectionForMode(anti_module->get_desync_hotkey_mode());
+                                            child->make_text("Desync hotkey (leave empty for always-on).");
+                                            child->make_keybind(&desync_key_code, &desync_key_mode);
+                                            if (desync_key_code != anti_module->get_desync_hotkey())
+                                                anti_module->set_desync_hotkey(desync_key_code);
+                                            auto desired_mode = KeybindModeFromUiSelection(desync_key_mode);
+                                            if (desired_mode != anti_module->get_desync_hotkey_mode())
+                                                anti_module->set_desync_hotkey_mode(desired_mode);
+                                            child->make_text("Use hold for momentary desync or toggle to latch it.");
+                                        }
                                     }
 
                                     if (is_friends)
@@ -1841,6 +2069,108 @@ namespace cradle
                                     }
                                 }
 
+                                void RenderLightingColorPicker(evo::child_t *child,
+                                                              const char *label,
+                                                              cradle::engine::vector3 &value,
+                                                              float &hue_cache)
+                                {
+                                    evo::col_t color = Color3ToEvoColor(value);
+                                    if (hue_cache <= 0.0f)
+                                        hue_cache = color.hue();
+                                    child->make_text(label);
+                                    child->make_colorpicker(&color, &hue_cache);
+                                    value = ClampLightingColor(EvoColorToColor3(color));
+                                }
+
+                                void RenderLightingMemorySection(evo::child_t *child)
+                                {
+                                    auto &state = g_lighting_override_state;
+                                    child->make_text("Lighting overrides");
+
+                                    auto dm_instance = cradle::engine::DataModel::get_instance();
+                                    auto lighting = dm_instance.find_first_child_of_class("Lighting");
+                                    state.lighting_ready = lighting.is_valid();
+                                    child->make_text(state.lighting_ready ? "lighting ready" : "lighting missing");
+
+                                    if (!state.lighting_ready)
+                                    {
+                                        state.defaults_initialized = false;
+                                        state.last_lighting_address = 0;
+                                        child->make_text("join a game to edit lighting");
+                                        return;
+                                    }
+
+                                    EnsureLightingDefaults(state, lighting);
+
+                                    RenderLightingColorPicker(child, "ambient##lighting", state.ambient, state.ambient_hue);
+                                    RenderLightingColorPicker(child, "color shift (top)##lighting", state.color_shift_top, state.color_shift_top_hue);
+                                    RenderLightingColorPicker(child, "color shift (bottom)##lighting", state.color_shift_bottom, state.color_shift_bottom_hue);
+                                    RenderLightingColorPicker(child, "fog color##lighting", state.fog_color, state.fog_color_hue);
+
+                                    state.brightness = std::clamp(state.brightness, 0.0f, 10.0f);
+                                    child->make_slider_float("brightness##lighting", &state.brightness, 0.0f, 10.0f, "");
+                                    child->make_checkbox("lock lighting overrides", &state.lock_lighting);
+
+                                    cradle::engine::vector3 live_ambient;
+                                    float live_brightness = 0.0f;
+                                    if (TryReadLightingColor(lighting, Offsets::Lighting::Ambient, live_ambient) &&
+                                        TryReadLightingBrightness(lighting, live_brightness))
+                                    {
+                                        char live_buf[160];
+                                        std::snprintf(live_buf, sizeof(live_buf), "current ambient %.3f/%.3f/%.3f · brightness %.2f",
+                                                      live_ambient.X, live_ambient.Y, live_ambient.Z, live_brightness);
+                                        child->make_text(live_buf);
+                                    }
+
+                                    child->make_button("apply lighting", [&]() {
+                                        bool applied = ApplyLightingOverrides(state, lighting);
+                                        state.enforce_after_apply = applied;
+                                        if (applied)
+                                            state.last_enforce_time = ImGui::GetTime();
+                                    });
+
+                                    if (state.defaults_initialized)
+                                    {
+                                        child->make_button("reset lighting", [&]() {
+                                            state.ambient = state.default_ambient;
+                                            state.color_shift_bottom = state.default_color_shift_bottom;
+                                            state.color_shift_top = state.default_color_shift_top;
+                                            state.fog_color = state.default_fog_color;
+                                            state.brightness = state.default_brightness;
+                                            bool applied = ApplyLightingOverrides(state, lighting);
+                                            state.enforce_after_apply = applied;
+                                            if (applied)
+                                                state.last_enforce_time = ImGui::GetTime();
+                                        });
+
+                                        char defaults_buffer[196];
+                                        std::snprintf(defaults_buffer, sizeof(defaults_buffer),
+                                                      "defaults · ambient %.3f/%.3f/%.3f · brightness %.2f",
+                                                      state.default_ambient.X,
+                                                      state.default_ambient.Y,
+                                                      state.default_ambient.Z,
+                                                      state.default_brightness);
+                                        child->make_text(defaults_buffer);
+                                    }
+
+                                    if (state.last_apply_time > 0.0f)
+                                    {
+                                        if (state.last_apply_success)
+                                        {
+                                            char buffer[96];
+                                            std::snprintf(buffer, sizeof(buffer), "last apply succeeded %.1fs ago",
+                                                          static_cast<float>(ImGui::GetTime()) - state.last_apply_time);
+                                            child->make_text(buffer);
+                                        }
+                                        else
+                                        {
+                                            child->make_text("last apply failed · ensure lighting is writable");
+                                        }
+                                    }
+
+                                    child->make_text("values clamp to RGB 0-1; divide 0-255 colors by 255");
+                                }
+
                                 void RenderMemoryPanel(evo::child_t *child, MemoryPanelSection section)
                                 {
                                     child->make_text("MemoryWrite · risky");
@@ -1855,6 +2185,9 @@ namespace cradle
                                         break;
                                     case MemoryPanelSection::Gravity:
                                         RenderGravityMemorySection(child);
+                                        break;
+                                    case MemoryPanelSection::Lighting:
+                                        RenderLightingMemorySection(child);
                                         break;
                                     default:
                                         child->make_text("Select a memory override module on the left.");
@@ -2251,6 +2584,7 @@ namespace cradle
                                     cradle::engine::PlayerCache::update_cache();
                                     TickMovementOverrides();
                                     TickGravityOverride();
+                                    TickLightingOverrides();
 
                                     static auto last_wall_cache_tick = std::chrono::steady_clock::time_point{};
                                     auto now = std::chrono::steady_clock::now();

@@ -2,6 +2,7 @@
 #include "../modules/module_manager.hpp"
 #include "../modules/module.hpp"
 #include "../modules/friend_manager.hpp"
+#include "../modules/anti_aim/anti_aim_module.hpp"
 #include <filesystem>
 #include <fstream>
 #include <sstream>
@@ -255,6 +256,28 @@ namespace cradle::config
                 continue;
             }
 
+            if (auto *anti_module = dynamic_cast<modules::AntiAimModule *>(module))
+            {
+                if (setting_name == "desync_hotkey")
+                {
+                    try { anti_module->set_desync_hotkey(std::stoi(value)); } catch (...) {}
+                    continue;
+                }
+
+                if (setting_name == "desync_hotkey_mode")
+                {
+                    try
+                    {
+                        int mode = std::stoi(value);
+                        anti_module->set_desync_hotkey_mode(mode == static_cast<int>(modules::KeybindMode::HOLD) ? modules::KeybindMode::HOLD : modules::KeybindMode::TOGGLE);
+                    }
+                    catch (...)
+                    {
+                    }
+                    continue;
+                }
+            }
+
             auto *setting = module->get_setting(setting_name);
             if (!setting)
                 continue;
@@ -305,6 +328,13 @@ namespace cradle::config
                 }
                 output << '\n';
             }
+
+            if (auto *anti_module = dynamic_cast<modules::AntiAimModule *>(module))
+            {
+                output << module->get_name() << ":desync_hotkey=" << anti_module->get_desync_hotkey() << '\n';
+                output << module->get_name() << ":desync_hotkey_mode=" << static_cast<int>(anti_module->get_desync_hotkey_mode()) << '\n';
+            }
+
             output << '\n';
         }
 
