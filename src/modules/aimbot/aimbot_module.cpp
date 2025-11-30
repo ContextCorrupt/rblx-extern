@@ -24,7 +24,8 @@ namespace cradle::modules
         settings.push_back(Setting("fov always visible", false));
         settings.push_back(Setting("wall check", true));
         settings.push_back(Setting("team check", true));
-    settings.push_back(Setting("smoothness", 0.0f, 0.0f, 0.9995f));
+        settings.push_back(Setting("target lock", false));
+        settings.push_back(Setting("smoothness", 0.0f, 0.0f, 0.9995f));
         settings.push_back(Setting("fov color", 1.0f, 1.0f, 1.0f, 1.0f));
         settings.push_back(Setting("target priority mode", 0, 0, 2));
         settings.push_back(Setting("max distance", 2000.0f, 0.0f, 10000.0f));
@@ -37,17 +38,22 @@ namespace cradle::modules
             auto fov_size_setting = get_setting("fov size");
             auto wall_check_setting = get_setting("wall check");
             auto team_check_setting = get_setting("team check");
+            auto target_lock_setting = get_setting("target lock");
             auto smoothness_setting = get_setting("smoothness");
             auto target_priority_setting = get_setting("target priority mode");
 
-            if (!fov_size_setting || !wall_check_setting || !team_check_setting || !smoothness_setting || !target_priority_setting)
+            if (!fov_size_setting || !wall_check_setting || !team_check_setting || !target_lock_setting || !smoothness_setting || !target_priority_setting)
                 return;
+
+            auto clear_locked_target = [&]() { locked_character_address = 0; };
 
             float fov_size = fov_size_setting->value.float_val;
             bool wall_check = wall_check_setting->value.bool_val;
             bool team_check = team_check_setting->value.bool_val;
+            bool target_lock_enabled = target_lock_setting->value.bool_val;
             float smoothness = smoothness_setting->value.float_val;
             int target_priority_mode = target_priority_setting->value.int_val;
+            const float fov_size_sq = fov_size * fov_size;
             if (target_priority_mode < 0 || target_priority_mode > 2)
             {
                 target_priority_mode = 0;
@@ -112,6 +118,8 @@ namespace cradle::modules
             Player closest_player;
             float best_metric = FLT_MAX;
             float best_secondary_metric = FLT_MAX;
+            Player locked_candidate;
+            bool locked_candidate_valid = false;
 
             for (const auto &p : players)
             {
@@ -119,6 +127,8 @@ namespace cradle::modules
                     continue;
                 if (!p.character.is_valid() || !p.hrp.is_valid())
                     continue;
+
+                bool is_locked_target = target_lock_enabled && locked_character_address != 0 && p.character.address == locked_character_address;
 
                 if (p.character.address == local.character.address)
                     continue;
@@ -160,8 +170,7 @@ namespace cradle::modules
                 float dx_screen = screen_pos.X - cursor_pos.x;
                 float dy_screen = screen_pos.Y - cursor_pos.y;
                 float screen_dist_sq = dx_screen * dx_screen + dy_screen * dy_screen;
-                const float fov_size_sq = fov_size * fov_size;
-                if (screen_dist_sq > fov_size_sq)
+                if (!is_locked_target && screen_dist_sq > fov_size_sq)
                     continue;
 
                 if (wall_check && Wallcheck::is_cache_ready())
@@ -174,6 +183,12 @@ namespace cradle::modules
                     vector3 pelvis_pos = fetch_pos(p.lower_torso, torso_pos);
                     if (!Wallcheck::is_visible(camera_pos, head_pos, torso_pos, pelvis_pos, p.character.address))
                         continue;
+                }
+
+                if (is_locked_target)
+                {
+                    locked_candidate = p;
+                    locked_candidate_valid = true;
                 }
 
                 float priority_metric = screen_dist_sq;
@@ -201,21 +216,42 @@ namespace cradle::modules
                 }
             }
 
+            if (target_lock_enabled && locked_candidate_valid)
+            {
+                closest_player = locked_candidate;
+                found_target = true;
+            }
+
             if (!found_target)
+            {
+                clear_locked_target();
                 return;
+            }
             if (!closest_player.is_valid() || !closest_player.character.is_valid())
+            {
+                clear_locked_target();
                 return;
+            }
             if (!closest_player.head.is_valid())
+            {
+                clear_locked_target();
                 return;
+            }
             if (closest_player.humanoid.is_valid())
             {
                 if (!closest_player.humanoid.get_visible_flag())
+                {
+                    clear_locked_target();
                     return;
+                }
             }
 
             vector3 target_pos = closest_player.head.is_valid() ? closest_player.head.get_cframe().position : vector3();
             if (target_pos.X == 0 && target_pos.Y == 0 && target_pos.Z == 0)
+            {
+                clear_locked_target();
                 return;
+            }
 
             if (wall_check && Wallcheck::is_cache_ready())
             {
@@ -226,8 +262,16 @@ namespace cradle::modules
                 vector3 torso_pos = fetch_pos(closest_player.hrp.is_valid() ? closest_player.hrp : closest_player.upper_torso, head_pos);
                 vector3 pelvis_pos = fetch_pos(closest_player.lower_torso, torso_pos);
                 if (!Wallcheck::is_visible(camera_pos, head_pos, torso_pos, pelvis_pos, closest_player.character.address))
+                {
+                    clear_locked_target();
                     return;
+                }
             }
+
+            if (target_lock_enabled)
+                locked_character_address = closest_player.character.address;
+            else
+                clear_locked_target();
 
             // Determine whether the in-game cursor is locked by checking if the cursor
             // is approximately at the center of the Roblox client window. This is
