@@ -170,7 +170,7 @@ namespace cradle::modules
                 float dx_screen = screen_pos.X - cursor_pos.x;
                 float dy_screen = screen_pos.Y - cursor_pos.y;
                 float screen_dist_sq = dx_screen * dx_screen + dy_screen * dy_screen;
-                if (!is_locked_target && screen_dist_sq > fov_size_sq)
+                if (screen_dist_sq > fov_size_sq)
                     continue;
 
                 if (wall_check && Wallcheck::is_cache_ready())

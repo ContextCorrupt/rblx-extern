@@ -2605,6 +2605,14 @@ namespace cradle
                                 if (!overlayWindow)
                                     return;
 
+                                auto update_visibility = [&](bool visible) {
+                                    static bool overlay_visible = true;
+                                    if (visible == overlay_visible)
+                                        return;
+                                    ShowWindow(overlayWindow, visible ? SW_SHOW : SW_HIDE);
+                                    overlay_visible = visible;
+                                };
+
                                 using clock = std::chrono::steady_clock;
                                 static HWND cached_window = nullptr;
                                 static RECT last_rect{0, 0, 0, 0};
@@ -2616,6 +2624,8 @@ namespace cradle
                                 constexpr auto kRectPollInterval = std::chrono::milliseconds(16);
 
                                 auto now = clock::now();
+                                bool loader_visible = Overlay::get_loading_stage() != Overlay::LoadingStage::Ready;
+                                bool menu_forces_visible = menu_visible;
 
                                 if (!cached_window || (now - last_handle_refresh) >= kHandleRefreshInterval)
                                 {
@@ -2625,7 +2635,10 @@ namespace cradle
                                 }
 
                                 if (!cached_window)
+                                {
+                                    update_visibility(loader_visible || menu_forces_visible);
                                     return;
+                                }
 
                                 if (!needs_sync && (now - last_rect_poll) < kRectPollInterval)
                                     return;
@@ -2639,6 +2652,15 @@ namespace cradle
                                 }
 
                                 last_rect_poll = now;
+
+                                HWND foreground = GetForegroundWindow();
+                                HWND foreground_root = foreground ? GetAncestor(foreground, GA_ROOT) : nullptr;
+                                HWND effective_foreground = foreground_root ? foreground_root : foreground;
+                                bool roblox_active = (effective_foreground == cached_window);
+                                bool should_show_overlay = roblox_active || menu_forces_visible || loader_visible;
+                                update_visibility(should_show_overlay);
+                                if (!should_show_overlay)
+                                    return;
 
                                 if (!needs_sync &&
                                     rect.left == last_rect.left &&

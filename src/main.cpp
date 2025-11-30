@@ -336,8 +336,24 @@ int main()
         spdlog::info("overlay initialized - press delete to toggle menu");
     });
 
+    bool roblox_monitor_ready = false;
     while (overlay.isRunning())
     {
+        if (!roblox_monitor_ready && cradle::overlay::Overlay::is_runtime_ready())
+            roblox_monitor_ready = true;
+
+        if (roblox_monitor_ready)
+        {
+            HANDLE roblox_handle = cradle::memory::processHandle;
+            if (roblox_handle && WaitForSingleObject(roblox_handle, 0) == WAIT_OBJECT_0)
+            {
+                spdlog::info("Roblox process closed; shutting down cheat.");
+                shutdown_requested.store(true, std::memory_order_relaxed);
+                PostQuitMessage(0);
+                break;
+            }
+        }
+
         overlay.render();
     }
 
