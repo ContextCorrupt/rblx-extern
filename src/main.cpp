@@ -177,7 +177,7 @@ namespace
             return;
         }
 
-        Instance lighting = dm.find_first_child_of_class("Lighting");
+    Instance lighting = dm.get_lighting();
         if (!lighting.is_valid())
         {
             std::cout << "[lighting] Lighting service missing; cannot dump offsets" << std::endl;

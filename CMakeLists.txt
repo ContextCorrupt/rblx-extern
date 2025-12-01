@@ -18,6 +18,7 @@ file(GLOB_RECURSE SOURCES
     ${PROJECT_SOURCE_DIR}/src/config/*.cpp
     ${PROJECT_SOURCE_DIR}/src/util/engine/instance/*.cpp
     ${PROJECT_SOURCE_DIR}/src/util/engine/datamodel/*.cpp
+    ${PROJECT_SOURCE_DIR}/src/util/engine/lighting/*.cpp
     ${PROJECT_SOURCE_DIR}/src/util/engine/input/*.cpp
     ${PROJECT_SOURCE_DIR}/src/util/engine/visualengine/*.cpp
     ${PROJECT_SOURCE_DIR}/src/util/engine/wallcheck/*.cpp

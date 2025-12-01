@@ -28,5 +28,7 @@ namespace cradle::engine
         Instance get_players();
         Instance get_script_context();
         Instance get_current_camera();
+        Instance get_lighting();
+        Instance get_render_view();
     };
 }

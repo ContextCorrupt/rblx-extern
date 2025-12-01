@@ -37,6 +37,7 @@ extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd, UINT msg
 #include "../util/engine/datamodel/datamodel.hpp"
 #include "../util/engine/instance/instance.hpp"
 #include "../util/engine/wallcheck/wallcheck.hpp"
+#include "../util/engine/lighting/lighting.hpp"
 #include "../util/engine/offsets.hpp"
 #include "../cache/player_cache.hpp"
 #include "../modules/module_manager.hpp"
@@ -214,6 +215,7 @@ namespace cradle
 
                 bool defaults_initialized = false;
                 bool lighting_ready = false;
+                bool render_view_ready = false;
                 bool last_apply_success = false;
                 float last_apply_time = 0.0f;
                 uintptr_t last_lighting_address = 0;
@@ -621,9 +623,11 @@ namespace cradle
                 state.defaults_initialized = true;
             }
 
-            bool ApplyLightingOverrides(LightingOverrideState &state, const cradle::engine::Instance &lighting)
+            bool ApplyLightingOverrides(LightingOverrideState &state,
+                                         const cradle::engine::Instance &lighting,
+                                         const cradle::engine::Instance &render_view)
             {
-                if (!lighting.is_valid())
+                if (!lighting.is_valid() || !render_view.is_valid())
                     return false;
 
                 state.ambient = ClampLightingColor(state.ambient);
@@ -652,17 +656,27 @@ namespace cradle
                 ok &= TryWriteLightingFloat(lighting, Offsets::Lighting::GeographicLatitude, state.geographic_latitude);
 
                 state.last_apply_time = static_cast<float>(ImGui::GetTime());
-                state.last_apply_success = ok;
-                return ok;
+
+                bool invalidated = false;
+                if (ok)
+                {
+                    invalidated = cradle::engine::lighting::invalidate(render_view);
+                }
+
+                state.last_apply_success = ok && invalidated;
+                return state.last_apply_success;
             }
 
             void TickLightingOverrides()
             {
                 auto &state = g_lighting_override_state;
                 auto dm_instance = cradle::engine::DataModel::get_instance();
-                auto lighting = dm_instance.find_first_child_of_class("Lighting");
+                auto lighting = dm_instance.get_lighting();
+                auto render_view = dm_instance.get_render_view();
 
                 state.lighting_ready = lighting.is_valid();
+                state.render_view_ready = render_view.is_valid();
+
                 if (!state.lighting_ready)
                 {
                     state.defaults_initialized = false;
@@ -673,6 +687,12 @@ namespace cradle
 
                 EnsureLightingDefaults(state, lighting);
 
+                if (!state.render_view_ready)
+                {
+                    state.enforce_after_apply = false;
+                    return;
+                }
+
                 double now = ImGui::GetTime();
                 bool needs_apply = state.pending_apply;
                 bool enforce = state.lock_lighting || state.enforce_after_apply || needs_apply;
@@ -682,7 +702,7 @@ namespace cradle
                 if ((now - state.last_enforce_time) < kLightingEnforceInterval)
                     return;
 
-                bool applied = ApplyLightingOverrides(state, lighting);
+                bool applied = ApplyLightingOverrides(state, lighting, render_view);
                 state.last_enforce_time = now;
 
                 if (applied && needs_apply)
@@ -2214,9 +2234,12 @@ namespace cradle
                                     child->make_text("Based on lr/lighting_reference.txt offsets (Ambient, OutdoorAmbient, Fog, Time).");
 
                                     auto dm_instance = cradle::engine::DataModel::get_instance();
-                                    auto lighting = dm_instance.find_first_child_of_class("Lighting");
+                                    auto lighting = dm_instance.get_lighting();
+                                    auto render_view = dm_instance.get_render_view();
                                     state.lighting_ready = lighting.is_valid();
+                                    state.render_view_ready = render_view.is_valid();
                                     child->make_text(state.lighting_ready ? "lighting ready" : "lighting missing");
+                                    child->make_text(state.render_view_ready ? "render view ready" : "render view missing");
 
                                     if (!state.lighting_ready)
                                     {
@@ -2298,8 +2321,8 @@ namespace cradle
                                         child->make_text(live_buf);
                                     }
 
-                                    child->make_button("apply lighting", [&]() {
-                                        bool applied = ApplyLightingOverrides(state, lighting);
+                                    child->make_button("apply lighting", [&, render_view]() {
+                                        bool applied = ApplyLightingOverrides(state, lighting, render_view);
                                         state.enforce_after_apply = applied;
                                         if (applied)
                                         {
@@ -2310,7 +2333,7 @@ namespace cradle
 
                                     if (state.defaults_initialized)
                                     {
-                                        child->make_button("reset lighting", [&]() {
+                                        child->make_button("reset lighting", [&, render_view]() {
                                             state.ambient = state.default_ambient;
                                             state.color_shift_bottom = state.default_color_shift_bottom;
                                             state.color_shift_top = state.default_color_shift_top;
@@ -2322,7 +2345,7 @@ namespace cradle
                                             state.exposure_compensation = state.default_exposure_compensation;
                                             state.clock_time = state.default_clock_time;
                                             state.geographic_latitude = state.default_geographic_latitude;
-                                            bool applied = ApplyLightingOverrides(state, lighting);
+                                            bool applied = ApplyLightingOverrides(state, lighting, render_view);
                                             state.enforce_after_apply = applied;
                                             if (applied)
                                             {

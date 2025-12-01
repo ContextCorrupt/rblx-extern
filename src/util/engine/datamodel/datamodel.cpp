@@ -1,6 +1,34 @@
 #include "datamodel.hpp"
 #include "../../memory/memory.hpp"
 
+namespace
+{
+    std::uintptr_t g_cached_lighting = 0;
+    std::uintptr_t g_cached_lighting_owner = 0;
+
+    void invalidate_lighting_cache()
+    {
+        g_cached_lighting = 0;
+        g_cached_lighting_owner = 0;
+    }
+
+    bool is_cached_lighting_valid(std::uintptr_t datamodel_address)
+    {
+        if (!cradle::memory::IsValid(datamodel_address) || !cradle::memory::IsValid(g_cached_lighting))
+            return false;
+
+        cradle::engine::Instance candidate(g_cached_lighting);
+        if (!candidate.is_valid())
+            return false;
+
+        std::uintptr_t parent = cradle::memory::read<std::uintptr_t>(g_cached_lighting + Offsets::Instance::Parent);
+        if (parent != datamodel_address)
+            return false;
+
+        return candidate.get_class_name() == "Lighting";
+    }
+}
+
 namespace cradle::engine
 {
 
@@ -106,5 +134,52 @@ namespace cradle::engine
     Instance DataModel::get_current_camera()
     {
         return get_workspace().find_first_child("Camera");
+    }
+
+    Instance DataModel::get_lighting()
+    {
+        if (!address || address < 0x10000)
+        {
+            invalidate_lighting_cache();
+            return Instance(0);
+        }
+
+        if (g_cached_lighting && g_cached_lighting_owner == address && is_cached_lighting_valid(address))
+        {
+            return Instance(g_cached_lighting);
+        }
+
+        Instance lighting = find_first_child_of_class("Lighting");
+        if (lighting.is_valid())
+        {
+            g_cached_lighting = lighting.address;
+            g_cached_lighting_owner = address;
+        }
+        else
+        {
+            invalidate_lighting_cache();
+        }
+
+        return lighting;
+    }
+
+    Instance DataModel::get_render_view()
+    {
+        if (!address || address < 0x10000)
+            return Instance(0);
+
+        std::uintptr_t render_entry = cradle::memory::read<std::uintptr_t>(address + Offsets::DataModel::LightingService);
+        if (!cradle::memory::IsValid(render_entry))
+            return Instance(0);
+
+        std::uintptr_t singleton = cradle::memory::read<std::uintptr_t>(render_entry + Offsets::LightingService::Singleton);
+        if (!cradle::memory::IsValid(singleton))
+            return Instance(0);
+
+        std::uintptr_t render_view = cradle::memory::read<std::uintptr_t>(singleton + Offsets::LightingService::Instance);
+        if (!cradle::memory::IsValid(render_view))
+            return Instance(0);
+
+        return Instance(render_view);
     }
 }

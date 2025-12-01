@@ -48,6 +48,7 @@ namespace Offsets {
          inline constexpr uintptr_t GameId = 0x190;
          inline constexpr uintptr_t GameLoaded = 0x5f0;
          inline constexpr uintptr_t JobId = 0x138;
+         inline constexpr uintptr_t LightingService = 0x1d0;
          inline constexpr uintptr_t PlaceId = 0x198;
          inline constexpr uintptr_t PlaceVersion = 0x1d;
          inline constexpr uintptr_t PrimitiveCount = 0x430;
@@ -11565,7 +11566,13 @@ namespace Offsets {
          inline constexpr uintptr_t FogEnd = 0x134;
          inline constexpr uintptr_t FogStart = 0x138;
          inline constexpr uintptr_t GeographicLatitude = 0x190;
+         inline constexpr uintptr_t InvalidateFlag = 0x148;
          inline constexpr uintptr_t OutdoorAmbient = 0x108;
+    }
+
+    namespace LightingService {
+         inline constexpr uintptr_t Singleton = 0x8;
+         inline constexpr uintptr_t Instance = 0x28;
     }
 
     namespace MeshPart {
