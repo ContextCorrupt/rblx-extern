@@ -348,12 +348,11 @@ void evo::child_t::obj( slider_float_t* slider ) {
 			this->base_element.x, this->base_element.y[ this->child_id ]
 		};
 
-		if ( this->hovered( ) ) {
-			/*
-				* update checkbox if we hover the child
-			*/
-			slider->input( );
-		}
+		/*
+			* process slider input even if the parent child isn't hovered so dragging
+			* continues to work after the initial click
+		*/
+		slider->input( );
 
 		/* paint checkbox */
 		slider->paint( );
@@ -380,12 +379,10 @@ void evo::child_t::obj( slider_int_t* slider ) {
 			this->base_element.x, this->base_element.y[ this->child_id ]
 		};
 
-		if ( this->hovered( ) ) {
-			/*
-				* update checkbox if we hover the child
-			*/
-			slider->input( );
-		}
+		/*
+			* always allow slider input so users can drag without the child hover gate
+		*/
+		slider->input( );
 
 		/* paint checkbox */
 		slider->paint( );

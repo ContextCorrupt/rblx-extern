@@ -163,6 +163,7 @@ namespace cradle
             constexpr double kGravityEnforceInterval = 0.05;
             constexpr float kDefaultGravity = 196.2f;
             constexpr double kLightingEnforceInterval = 0.05;
+            constexpr double kLightingValidateInterval = 0.1;
             constexpr float kLightingMaxFogDistance = 100000.0f;
             constexpr float kLightingClockMin = 0.0f;
             constexpr float kLightingClockMax = 24.0f;
@@ -222,6 +223,7 @@ namespace cradle
                 bool lock_lighting = false;
                 bool enforce_after_apply = false;
                 double last_enforce_time = 0.0;
+                double last_validation_time = 0.0;
 
                 float ambient_hue = 0.0f;
                 float color_shift_bottom_hue = 0.0f;
@@ -232,7 +234,14 @@ namespace cradle
                 bool pending_apply = false;
             };
 
-            static bool nearly_equal(float a, float b, float eps);
+        static bool nearly_equal(float a, float b, float eps);
+        cradle::engine::vector3 ClampLightingColor(const cradle::engine::vector3 &color);
+        bool TryReadLightingColor(const cradle::engine::Instance &lighting, uintptr_t offset, cradle::engine::vector3 &color);
+        bool TryWriteLightingColor(const cradle::engine::Instance &lighting, uintptr_t offset, cradle::engine::vector3 color);
+        bool TryReadLightingBrightness(const cradle::engine::Instance &lighting, float &brightness);
+        bool TryWriteLightingBrightness(const cradle::engine::Instance &lighting, float brightness);
+        bool TryReadLightingFloat(const cradle::engine::Instance &lighting, uintptr_t offset, float &value_out);
+        bool TryWriteLightingFloat(const cradle::engine::Instance &lighting, uintptr_t offset, float value);
 
             bool LightingVectorChanged(const cradle::engine::vector3 &before, const cradle::engine::vector3 &after)
             {
@@ -556,6 +565,77 @@ namespace cradle
                 return cradle::memory::write<float>(lighting.address + offset, value);
             }
 
+            bool LightingNeedsReapply(const LightingOverrideState &state, const cradle::engine::Instance &lighting)
+            {
+                if (!lighting.is_valid())
+                    return false;
+
+                cradle::engine::vector3 ambient{};
+                cradle::engine::vector3 cs_bottom{};
+                cradle::engine::vector3 cs_top{};
+                cradle::engine::vector3 fog{};
+                cradle::engine::vector3 outdoor{};
+                float brightness = 0.0f;
+                float fog_start = 0.0f;
+                float fog_end = 0.0f;
+                float exposure = 0.0f;
+                float clock_time = 0.0f;
+                float latitude = 0.0f;
+
+                bool ok = true;
+                ok &= TryReadLightingColor(lighting, Offsets::Lighting::Ambient, ambient);
+                ok &= TryReadLightingColor(lighting, Offsets::Lighting::ColorShift_Bottom, cs_bottom);
+                ok &= TryReadLightingColor(lighting, Offsets::Lighting::ColorShift_Top, cs_top);
+                ok &= TryReadLightingColor(lighting, Offsets::Lighting::FogColor, fog);
+                ok &= TryReadLightingColor(lighting, Offsets::Lighting::OutdoorAmbient, outdoor);
+                ok &= TryReadLightingBrightness(lighting, brightness);
+                ok &= TryReadLightingFloat(lighting, Offsets::Lighting::FogStart, fog_start);
+                ok &= TryReadLightingFloat(lighting, Offsets::Lighting::FogEnd, fog_end);
+                ok &= TryReadLightingFloat(lighting, Offsets::Lighting::ExposureCompensation, exposure);
+                ok &= TryReadLightingFloat(lighting, Offsets::Lighting::ClockTime, clock_time);
+                ok &= TryReadLightingFloat(lighting, Offsets::Lighting::GeographicLatitude, latitude);
+
+                if (!ok)
+                    return true;
+
+                auto desired_ambient = ClampLightingColor(state.ambient);
+                auto desired_cs_bottom = ClampLightingColor(state.color_shift_bottom);
+                auto desired_cs_top = ClampLightingColor(state.color_shift_top);
+                auto desired_fog = ClampLightingColor(state.fog_color);
+                auto desired_outdoor = ClampLightingColor(state.outdoor_ambient);
+                float desired_brightness = std::clamp(state.brightness, 0.0f, 10.0f);
+                float desired_fog_start = std::clamp(state.fog_start, 0.0f, kLightingMaxFogDistance);
+                float desired_fog_end = std::clamp(state.fog_end, desired_fog_start + 0.1f, kLightingMaxFogDistance);
+                float desired_exposure = std::clamp(state.exposure_compensation, kLightingExposureMin, kLightingExposureMax);
+                float desired_clock = std::clamp(state.clock_time, kLightingClockMin, kLightingClockMax);
+                float desired_latitude = std::clamp(state.geographic_latitude, kLightingLatitudeMin, kLightingLatitudeMax);
+
+                if (LightingVectorChanged(ambient, desired_ambient))
+                    return true;
+                if (LightingVectorChanged(cs_bottom, desired_cs_bottom))
+                    return true;
+                if (LightingVectorChanged(cs_top, desired_cs_top))
+                    return true;
+                if (LightingVectorChanged(fog, desired_fog))
+                    return true;
+                if (LightingVectorChanged(outdoor, desired_outdoor))
+                    return true;
+                if (LightingFloatChanged(brightness, desired_brightness))
+                    return true;
+                if (LightingFloatChanged(fog_start, desired_fog_start))
+                    return true;
+                if (LightingFloatChanged(fog_end, desired_fog_end))
+                    return true;
+                if (LightingFloatChanged(exposure, desired_exposure))
+                    return true;
+                if (LightingFloatChanged(clock_time, desired_clock, 0.001f))
+                    return true;
+                if (LightingFloatChanged(latitude, desired_latitude, 0.001f))
+                    return true;
+
+                return false;
+            }
+
             void EnsureLightingDefaults(LightingOverrideState &state, const cradle::engine::Instance &lighting)
             {
                 if (state.last_lighting_address != lighting.address)
@@ -687,6 +767,28 @@ namespace cradle
 
                 EnsureLightingDefaults(state, lighting);
 
+                static bool f6_previous = false;
+                bool f6_down = (GetAsyncKeyState(VK_F6) & 0x8000) != 0;
+                if (f6_down && !f6_previous)
+                {
+                    MarkLightingPendingApply(state);
+                    if (state.render_view_ready)
+                    {
+                        bool applied = ApplyLightingOverrides(state, lighting, render_view);
+                        state.last_enforce_time = ImGui::GetTime();
+                        if (applied)
+                        {
+                            state.pending_apply = false;
+                            state.enforce_after_apply = state.lock_lighting;
+                        }
+                        else
+                        {
+                            state.enforce_after_apply = state.lock_lighting || state.pending_apply;
+                        }
+                    }
+                }
+                f6_previous = f6_down;
+
                 if (!state.render_view_ready)
                 {
                     state.enforce_after_apply = false;
@@ -694,8 +796,19 @@ namespace cradle
                 }
 
                 double now = ImGui::GetTime();
+                bool enforce = state.lock_lighting || state.enforce_after_apply || state.pending_apply;
+
+                if (enforce && (now - state.last_validation_time) >= kLightingValidateInterval)
+                {
+                    state.last_validation_time = now;
+                    if (!state.pending_apply && LightingNeedsReapply(state, lighting))
+                    {
+                        MarkLightingPendingApply(state);
+                    }
+                }
+
                 bool needs_apply = state.pending_apply;
-                bool enforce = state.lock_lighting || state.enforce_after_apply || needs_apply;
+                enforce = state.lock_lighting || state.enforce_after_apply || needs_apply;
                 if (!enforce)
                     return;
 
